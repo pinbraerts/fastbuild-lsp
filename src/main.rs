@@ -78,6 +78,7 @@ fn main() -> Result<(), Error> {
     let server_capabilities = ServerCapabilities {
         definition_provider: Some(OneOf::Left(true)),
         declaration_provider: Some(DeclarationCapability::Simple(true)),
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
         ..Default::default()
     };
     let capabilities = serde_json::to_value(&server_capabilities)?;
@@ -128,6 +129,10 @@ impl Server {
                 let (id, param) = cast::<GotoDefinition>(request)?;
                 pack(id, self.goto_definition(param))
             },
+            HoverRequest::METHOD => {
+                let (id, param) = cast::<HoverRequest>(request)?;
+                pack(id, self.hover(param))
+            },
             _ => { return Err(Error::Unimplemented{ method: request.method }) },
         })
     }
@@ -166,6 +171,14 @@ impl Server {
     fn goto_definition(&self, parameters: GotoDefinitionParams) -> Result<GotoDefinitionResponse, Error> {
         info!("go to definition request {:?}", parameters);
         Ok(GotoDefinitionResponse::Scalar(self.builtins["Alias"].location.clone()))
+    }
+
+    fn hover(&self, parameters: HoverParams) -> Result<Hover, Error> {
+        info!("hover request {:?}", parameters);
+        Ok(Hover {
+            contents: HoverContents::Markup(self.builtins["Alias"].documentation.clone()),
+            range: None,
+        })
     }
 
 }
