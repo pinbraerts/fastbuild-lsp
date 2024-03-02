@@ -1,0 +1,44 @@
+/*
+ * @summary Creates and alias for one or more targets
+ *
+ * @param {string} name Name of alias
+ * @param {string | array[string]} Targets Targets to alias
+ * @param {boolean} [Hidden=false] Hide a target from -showtargets
+ *
+ * @details
+ * 
+ * Alias() can be used to create aliases to other nodes in the build.
+ * Aliases can be referenced within other Functions in the BFF config
+ * or from the command line.
+ * An Alias can refer to one or more nodes,
+ * and are typically used to simplify and de-duplicate configurations.
+ * Aliases can be nested (i.e. they can refer to other Aliases).
+ * One or more targets must be provided, either as a string or an array of strings.
+ *
+ * @example
+ * ```fastbuild
+ * ; group multiple build congfigurations under a common 'main' target
+ * Alias( 'main' )
+ * {
+ *  .Targets = { 'main-x86', 'main-x64' }
+ * }
+ * ```
+ *
+ * @example
+ * ```fastbuild
+ * ; provide a more human-friendly command line target
+ * Alias( 'Editor' )
+ * {
+ *  .Alias( 'Editor' )Targets = 'bin/Editor/X64/Release/Editor.exe'
+ * }
+ * ```
+ *
+ * @example
+ * ```fastbuild
+ * ; Targets can be previously defined nodes, or files external to the build process
+ * .Targets = { 'Library-Alias'                         ; A previously defined Alias()
+ *              'tmp/Libraries/X64/Release/Core.dll'    ; A previously defined DLL()
+ *              'External/SDK/VS2012/libs/libcmt.lib' } ; An external DLL import library
+ * ```
+ */
+function Alias(.name) { }
