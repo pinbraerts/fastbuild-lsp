@@ -1,11 +1,10 @@
-use std::{collections::HashMap, io, fs::File, path::Path, cell::{Cell, RefCell}};
+use std::{io, fs::File, path::Path};
+use dashmap::{DashMap, mapref::entry::Entry};
+use tower_lsp::lsp_types::{Location, MarkupContent, Url, Position, MarkupKind};
+use tree_sitter::Point;
 
-use dashmap::DashMap;
-use tower_lsp::lsp_types::{Location, MarkupContent, Url, Position, Range, MarkupKind, GotoDefinitionResponse};
-use tracing::info;
-use tree_sitter::{Parser, Query, QueryError, Language, QueryCursor, Tree, Node, Point, QueryCapture};
 
-use crate::{parser_pool::{ParserPool, new_pool}, queries::{Queries, query}};
+use crate::{parser_pool::{ParserPool, new_pool, ParserManager}, queries::{Queries, query}};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -41,11 +40,11 @@ pub fn markdown(value: String) -> MarkupContent {
 
 pub type Declarations = DashMap::<String, Location>;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct FileInformation {
     pub content: String,
     pub version: i32,
-    pub tree: Option<tree_sitter::Tree>,
+    pub tree: tree_sitter::Tree,
 }
 
 pub type FileCache = DashMap<Url, FileInformation>;
@@ -55,6 +54,13 @@ pub struct Cache {
     files: FileCache,
     parsers: ParserPool,
     queries: Queries,
+}
+
+pub fn point(position: Position) -> Point {
+    Point {
+       row: position.line as usize,
+        column: position.character as usize,
+    }
 }
 
 impl Cache {
@@ -78,30 +84,35 @@ impl Cache {
     }
 
     pub async fn add_file(&self, uri: Url, content: String, version: i32) -> Result<()> {
-        let mut entry = self.files.entry(uri.clone()).or_default();
-        let info = entry.value_mut();
-        if info.version > version {
-            return Ok(());
-        }
-        if info.version > version {
-            info.tree = None;
-        }
-        let new_tree = self.parsers
-            .get()
-            .await
-            .map_err(|_| Error::Unavailable)?
-            .parse(&content, info.tree.as_ref())
+        let entry = self.files.entry(uri.clone());
+        let tree = match &entry {
+            Entry::Occupied(occupied) => {
+                let old_version = occupied.get().version;
+                if old_version > version {
+                    return Ok(());
+                }
+                if old_version < version {
+                    None
+                }
+                else {
+                    Some(&occupied.get().tree)
+                }
+            },
+            Entry::Vacant(_) => None,
+        };
+
+        let tree = self.get_parser()
+            .await?
+            .parse(&content, tree)
             .ok_or(Error::TreeSitter)?;
 
-        query(&self.queries.function_definition, &new_tree, content.as_bytes())
+        query(&self.queries.function_definition, &tree, content.as_bytes())
             .into_iter()
             .for_each(|(range, content)| {
                 self.declarations.insert(content, Location { uri: uri.clone(), range });
-            })
-        ;
+            });
 
-        info.content = content;
-        info.tree = Some(new_tree);
+        entry.insert(FileInformation { content, tree, version });
         Ok(())
     }
 
@@ -111,31 +122,25 @@ impl Cache {
             .map(|reference| reference.clone())
     }
 
-    pub fn seek_word(line: &str, index: usize) -> (usize, usize) {
-        let allowed = |c: char| c.is_alphabetic() || c == '_' || c == '-';
-        let start = line
-            .chars()
-            .enumerate()
-            .take(index)
-            .filter(|&(_, c)| !allowed(c))
-            .last()
-            .map(|(i, _)| i + 1)
-            .unwrap_or(0);
-        let end = line
-            .chars()
-            .enumerate()
-            .skip(index)
-            .find(|&(_, c)| !allowed(c))
-            .map(|(i, _)| i)
-            .unwrap_or(index);
-        (start, end)
+    fn get_word(&self, uri: Url, position: Position) -> Option<String> {
+        let file = self.files.get(&uri)?;
+        let closest = file.tree.root_node().descendant_for_point_range(point(position), point(position))?;
+        match closest.kind() {
+            "identifier" => {
+                Some(closest)
+            },
+            "usage" => {
+                closest.child(0)
+            },
+            _ => None,
+        }?.utf8_text(file.content.as_bytes()).ok().map(|s| s.to_owned())
     }
 
-    pub fn get_word(&self, uri: Url, position: Position) -> Option<String> {
-        let file = self.files.get(&uri)?;
-        let line = file.content.lines().nth(position.line as usize)?;
-        let (start, end) = Self::seek_word(line, position.character as usize);
-        Some(line[start..end].to_owned())
+    async fn get_parser(&self) -> Result<deadpool::managed::Object<ParserManager>> {
+        self.parsers
+            .get()
+            .await
+            .map_err(|_| Error::Unavailable)
     }
 
 }
