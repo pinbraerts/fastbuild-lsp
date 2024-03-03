@@ -1,10 +1,10 @@
 use std::{io, fs::File, path::Path};
 use dashmap::{DashMap, mapref::entry::Entry};
-use tower_lsp::lsp_types::{Location, MarkupContent, Url, Position, MarkupKind};
-use tree_sitter::Point;
+use tower_lsp::lsp_types::{Location, MarkupContent, Url, Position, MarkupKind, Range};
+use tree_sitter::{Point, QueryCursor, QueryCapture};
 
 
-use crate::{parser_pool::{ParserPool, new_pool, ParserManager}, queries::{Queries, query}};
+use crate::{parser_pool::{ParserPool, new_pool, ParserManager}, queries::Queries};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -38,7 +38,28 @@ pub fn markdown(value: String) -> MarkupContent {
     MarkupContent { kind: MarkupKind::Markdown, value }
 }
 
-pub type Declarations = DashMap::<String, Location>;
+struct Declaration {
+    location: Location,
+    documentation: Option<MarkupContent>,
+}
+
+impl Declaration {
+    fn new(uri: &Url, capture: &QueryCapture, documentation: Option<&str>) -> Self {
+        Self {
+            location: Location {
+                uri: uri.clone(),
+                range: range(capture),
+            },
+            documentation: documentation.map(|text| {
+                text.lines()
+                    .map(|line| line.get(3..line.len()).unwrap_or_default())
+                    .fold(String::new(), |a, b| a + b + "\n")
+            }).map(markdown),
+        }
+    }
+}
+
+pub type Declarations = DashMap::<String, Declaration>;
 
 #[derive(Debug, Clone)]
 pub struct FileInformation {
@@ -54,6 +75,27 @@ pub struct Cache {
     files: FileCache,
     parsers: ParserPool,
     queries: Queries,
+}
+
+fn position(point: Point) -> Position {
+    Position {
+        line: point.row as u32,
+        character: point.column as u32,
+    }
+}
+
+fn range(capture: &QueryCapture) -> Range {
+    Range {
+        start: position(capture.node.start_position()),
+        end:   position(capture.node.end_position()),
+    }
+}
+
+fn content(capture: &QueryCapture, source: &[u8]) -> (Range, String) {
+    (
+        range(capture),
+        capture.node.utf8_text(source).unwrap_or_default().to_owned(),
+    )
 }
 
 pub fn point(position: Position) -> Point {
@@ -106,10 +148,32 @@ impl Cache {
             .parse(&content, tree)
             .ok_or(Error::TreeSitter)?;
 
-        query(&self.queries.function_definition, &tree, content.as_bytes())
-            .into_iter()
-            .for_each(|(range, content)| {
-                self.declarations.insert(content, Location { uri: uri.clone(), range });
+        let source = content.as_bytes();
+
+        QueryCursor::new()
+            .matches(&self.queries.function_definition, tree.root_node(), source)
+            .flat_map(|m| m.captures)
+            .for_each(|capture| {
+                let text = match capture.node.utf8_text(source) {
+                    Ok(text) => text,
+                    Err(_) => { return; },
+                }.to_owned();
+                let documentation = capture.node.parent()
+                    .map(|parent| {
+                        match parent.kind() {
+                            "function_definition" => parent.prev_sibling(),
+                            _ => None,
+                        }
+                    }).unwrap_or(None)
+                    .map(|sibling| {
+                        if sibling.kind() == "comment" {
+                            sibling.utf8_text(source).ok()
+                        }
+                        else {
+                            None
+                        }
+                    }).unwrap_or(None);
+                self.declarations.insert(text, Declaration::new(&uri, capture, documentation));
             });
 
         entry.insert(FileInformation { content, tree, version });
@@ -119,7 +183,14 @@ impl Cache {
     pub fn find_definition(&self, uri: Url, position: Position) -> Option<Location> {
         self.declarations
             .get(&self.get_word(uri, position)?)
-            .map(|reference| reference.clone())
+            .map(|reference| reference.location.clone())
+    }
+
+    pub fn find_hover(&self, uri: Url, position: Position) -> Option<MarkupContent> {
+        self.declarations
+            .get(&self.get_word(uri, position)?)
+            .map(|reference| reference.documentation.clone())
+            .unwrap_or(None)
     }
 
     fn get_word(&self, uri: Url, position: Position) -> Option<String> {

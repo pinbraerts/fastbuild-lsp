@@ -61,11 +61,9 @@ impl LanguageServer for Backend {
     async fn hover(&self, parameters: HoverParams) -> Result<Option<Hover>> {
         info!("hover request {:?}", parameters);
         let document = parameters.text_document_position_params;
-        Ok(self.cache.find_definition(document.text_document.uri, document.position)
-            .map(|declaration| Hover { 
-                contents: HoverContents::Scalar(MarkedString::String("default hover".to_owned())),
-                range: None
-            }))
+        Ok(self.cache.find_hover(document.text_document.uri, document.position)
+            .map(HoverContents::Markup)
+            .map(|contents| Hover { contents, range: None }))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -75,6 +73,16 @@ impl LanguageServer for Backend {
             return;
         }
         let _ = self.cache.add_file(document.uri, document.text, document.version).await;
+    }
+
+    async fn did_change(&self, mut params: DidChangeTextDocumentParams) {
+        info!("text document open {:?}", params);
+        let document = params.text_document;
+        if params.content_changes.len() != 1 {
+            warn!("file changes: {:?}", params.content_changes);
+            return;
+        }
+        let _ = self.cache.add_file(document.uri, std::mem::take(&mut params.content_changes[0].text), document.version).await;
     }
 
 }
