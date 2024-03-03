@@ -1,4 +1,6 @@
 pub mod cache;
+pub mod parser_pool;
+pub mod queries;
 
 use std::{fs::File, path::Path, collections::HashMap, io};
 
@@ -12,14 +14,6 @@ use tracing::{info, debug, Level, error, trace, warn};
 
 use crate::cache::FileCache;
 
-#[derive(Debug, Clone)]
-struct Declaration {
-    pub location: Location,
-    pub documentation: MarkupContent,
-}
-type Builtins = HashMap::<& 'static str, Declaration>;
-
-#[derive(Debug, Clone)]
 struct Backend {
     client: Client,
     cache: Cache,
@@ -52,22 +46,31 @@ impl LanguageServer for Backend {
     async fn goto_definition(&self, parameters: GotoDefinitionParams) -> Result<Option<GotoDefinitionResponse>> {
         info!("go to definition request {:?}", parameters);
         Ok(self.cache.find_definition()
-            .map(|declaration| GotoDefinitionResponse::Scalar(declaration.location.clone())))
+            .map(|declaration| GotoDefinitionResponse::Scalar(declaration)))
     }
 
     async fn goto_declaration(&self, parameters: GotoDefinitionParams) -> Result<Option<GotoDefinitionResponse>> {
         info!("go to definition request {:?}", parameters);
         Ok(self.cache.find_definition()
-            .map(|declaration| GotoDefinitionResponse::Scalar(declaration.location.clone())))
+            .map(|declaration| GotoDefinitionResponse::Scalar(declaration)))
     }
 
     async fn hover(&self, parameters: HoverParams) -> Result<Option<Hover>> {
         info!("hover request {:?}", parameters);
         Ok(self.cache.find_definition()
             .map(|declaration| Hover { 
-                contents: HoverContents::Markup(declaration.documentation.clone()),
-                range:None
+                contents: HoverContents::Scalar(MarkedString::String("default hover".to_owned())),
+                range: None
             }))
+    }
+
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        info!("text document open {:?}", params);
+        let document = params.text_document;
+        if document.language_id != "fastbuild" {
+            return;
+        }
+        let _ = self.cache.add_file(document.uri, document.text, document.version).await;
     }
 
 }
@@ -81,15 +84,14 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_writer(file)
         .with_target(false)
-        .with_max_level(Level::TRACE)
+        .with_max_level(Level::DEBUG)
         .init();
 
     info!("loading builtin declarations");
     let path = Path::new("/home/pinbraerts/src/fastbuild-lsp/builtins/alias.bff");
-    let builtins = Cache::load_file(path).await.unwrap();
-    let cache = Cache {
-        files: FileCache::from([builtins]),
-    };
+    let (url, content) = Cache::load_file(path).unwrap();
+    let cache = Cache::new();
+    cache.add_file(url, content, 0).await.unwrap();
 
     info!("starting LSP server");
     let (service, socket) = LspService::new(|client| Backend {
