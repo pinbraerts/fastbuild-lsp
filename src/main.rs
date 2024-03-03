@@ -28,6 +28,7 @@ impl LanguageServer for Backend {
                 declaration_provider: Some(DeclarationCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
                 ..Default::default()
             },
             ..Default::default()
@@ -45,19 +46,22 @@ impl LanguageServer for Backend {
 
     async fn goto_definition(&self, parameters: GotoDefinitionParams) -> Result<Option<GotoDefinitionResponse>> {
         info!("go to definition request {:?}", parameters);
-        Ok(self.cache.find_definition()
-            .map(|declaration| GotoDefinitionResponse::Scalar(declaration)))
+        let document = parameters.text_document_position_params;
+        Ok(self.cache.find_definition(document.text_document.uri, document.position)
+            .map(GotoDefinitionResponse::Scalar))
     }
 
     async fn goto_declaration(&self, parameters: GotoDefinitionParams) -> Result<Option<GotoDefinitionResponse>> {
         info!("go to definition request {:?}", parameters);
-        Ok(self.cache.find_definition()
-            .map(|declaration| GotoDefinitionResponse::Scalar(declaration)))
+        let document = parameters.text_document_position_params;
+        Ok(self.cache.find_definition(document.text_document.uri, document.position)
+            .map(GotoDefinitionResponse::Scalar))
     }
 
     async fn hover(&self, parameters: HoverParams) -> Result<Option<Hover>> {
         info!("hover request {:?}", parameters);
-        Ok(self.cache.find_definition()
+        let document = parameters.text_document_position_params;
+        Ok(self.cache.find_definition(document.text_document.uri, document.position)
             .map(|declaration| Hover { 
                 contents: HoverContents::Scalar(MarkedString::String("default hover".to_owned())),
                 range: None

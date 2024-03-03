@@ -75,26 +75,6 @@ impl Cache {
             .map_err(|_| Error::Uri { uri: filename.to_string_lossy().to_string() })?;
         let file = File::open(filename)?;
         Ok((uri, io::read_to_string(file)?))
-        // let lines = content.lines();
-        // Ok((uri.clone(), FileInformation {
-        //     content,
-        //     declarations: HashMap::from([
-        //         ("Alias", Declaration {
-        //             location: Location { uri, range: Range {
-        //                 start: Position { line: 42, character: 9 },
-        //                 end:   Position { line: 42, character: 14 },
-        //             }},
-        //             documentation: MarkupContent {
-        //                 kind: MarkupKind::Markdown,
-        //                 value: lines.take(35)
-        //                     .map(|line| line.get(4..line.len()).unwrap_or("") )
-        //                     .fold(String::new(), |a, b| a + b + "\n")
-        //                 ,
-        //             },
-        //         }),
-        //     ]),
-        //     tree: None,
-        // }))
     }
 
     pub async fn add_file(&self, uri: Url, content: String, version: i32) -> Result<()> {
@@ -125,9 +105,39 @@ impl Cache {
         Ok(())
     }
 
-    pub fn find_definition(&self) -> Option<Location> {
-        self.declarations.get("Alias").map(|reference| reference.clone())
+    pub fn find_definition(&self, uri: Url, position: Position) -> Option<Location> {
+        self.declarations
+            .get(&self.get_word(uri, position)?)
+            .map(|reference| reference.clone())
     }
+
+    pub fn seek_word(line: &str, index: usize) -> (usize, usize) {
+        let allowed = |c: char| c.is_alphabetic() || c == '_' || c == '-';
+        let start = line
+            .chars()
+            .enumerate()
+            .take(index)
+            .filter(|&(_, c)| !allowed(c))
+            .last()
+            .map(|(i, _)| i + 1)
+            .unwrap_or(0);
+        let end = line
+            .chars()
+            .enumerate()
+            .skip(index)
+            .find(|&(_, c)| !allowed(c))
+            .map(|(i, _)| i)
+            .unwrap_or(index);
+        (start, end)
+    }
+
+    pub fn get_word(&self, uri: Url, position: Position) -> Option<String> {
+        let file = self.files.get(&uri)?;
+        let line = file.content.lines().nth(position.line as usize)?;
+        let (start, end) = Self::seek_word(line, position.character as usize);
+        Some(line[start..end].to_owned())
+    }
+
 }
 
 impl Default for Cache {
