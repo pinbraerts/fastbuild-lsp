@@ -92,12 +92,19 @@ async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let file = File::create("/home/pinbraerts/src/fastbuild-lsp/log.log").unwrap();
-    tracing_subscriber::fmt()
-        .with_writer(file)
-        .with_target(false)
-        .with_max_level(Level::DEBUG)
-        .init();
+    let args : Vec<String> = std::env::args().collect();
+
+    let filename = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "/home/pinbraerts/src/fastbuild-lsp/log.log".to_string());
+    if let Ok(file) = File::create(filename) {
+        tracing_subscriber::fmt()
+            .with_writer(file)
+            .with_target(false)
+            .with_max_level(Level::DEBUG)
+            .init();
+    }
 
     info!("loading builtin declarations");
     let path = Path::new("/home/pinbraerts/src/fastbuild-lsp/builtins/alias.bff");
