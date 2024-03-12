@@ -1,11 +1,7 @@
 ///
 /// @brief Creates and alias for one or more targets
 ///
-/// @param {string} name Name of alias
-/// @param {string | array[string]} Targets Targets to alias
-/// @param {boolean} [Hidden=false] Hide a target from -showtargets
-///
-/// @details
+/// @summary
 /// Alias() can be used to create aliases to other nodes in the build.
 /// Aliases can be referenced within other Functions in the BFF config
 /// or from the command line.
@@ -13,6 +9,10 @@
 /// and are typically used to simplify and de-duplicate configurations.
 /// Aliases can be nested (i.e. they can refer to other Aliases).
 /// One or more targets must be provided, either as a string or an array of strings.
+///
+/// @param {string} name Name of alias
+/// @param {string | array[string]} Targets Targets to alias
+/// @param {boolean} [Hidden=false] Hide a target from -showtargets
 ///
 /// @example
 /// ```fastbuild
