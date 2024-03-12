@@ -149,31 +149,31 @@ impl Cache {
             .ok_or(Error::TreeSitter)?;
 
         let source = content.as_bytes();
+        let names = &self.queries.function_definition.capture_names();
 
         QueryCursor::new()
             .matches(&self.queries.function_definition, tree.root_node(), source)
-            .flat_map(|m| m.captures)
-            .for_each(|capture| {
-                let text = match capture.node.utf8_text(source) {
-                    Ok(text) => text,
+            .for_each(|m| {
+                let documentation = m.captures
+                    .iter()
+                    .find(|c| names[c.index as usize] == "documentation")
+                    .map(|c| c.node.utf8_text(source).unwrap_or_default())
+                ;
+                let definition = m.captures
+                    .iter()
+                    .find(|c| names[c.index as usize] == "name");
+                let definition = match definition {
+                    Some(d) => d,
+                    None => { return; },
+                };
+                let text = match definition.node.utf8_text(source) {
+                    Ok(text) => text.to_owned(),
                     Err(_) => { return; },
-                }.to_owned();
-                let documentation = capture.node.parent()
-                    .map(|parent| {
-                        match parent.kind() {
-                            "function_definition" => parent.prev_sibling(),
-                            _ => None,
-                        }
-                    }).unwrap_or(None)
-                    .map(|sibling| {
-                        if sibling.kind() == "comment" {
-                            sibling.utf8_text(source).ok()
-                        }
-                        else {
-                            None
-                        }
-                    }).unwrap_or(None);
-                self.declarations.insert(text, Declaration::new(&uri, capture, documentation));
+                };
+                self.declarations.insert(
+                    text,
+                    Declaration::new(&uri, definition, documentation)
+                );
             });
 
         entry.insert(FileInformation { content, tree, version });

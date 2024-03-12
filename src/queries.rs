@@ -5,13 +5,19 @@ pub struct Queries {
 }
 
 // (
-//  (comment) @documentation
+//  (comment)* @documentation
 //  .
-//  (function_definition)
+//  (function_definition (identifier) @definition)
 // )
 impl Queries {
     pub fn new(language: &Language) -> Result<Self, QueryError> {
-        Query::new(language, "(function_definition name: (identifier) @name)")
+        Query::new(language, "
+(
+  (comment)* @documentation
+  .
+  (function_definition name: (identifier) @name)
+)
+")
             .map(|query| Queries { function_definition: query })
     }
 }
