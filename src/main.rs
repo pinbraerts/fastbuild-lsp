@@ -109,7 +109,9 @@ async fn main() {
     info!("loading builtin declarations");
     let path = Path::new("/home/pinbraerts/src/fastbuild-lsp/builtins/alias.bff");
     let (url, content) = Cache::load_file(path).unwrap();
-    let cache = Cache::new();
+
+    info!("creating cache");
+    let cache = Cache::new().unwrap();
     cache.add_file(url, content, 0).await.unwrap();
 
     info!("starting LSP server");

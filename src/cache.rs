@@ -1,7 +1,8 @@
 use std::{io, fs::File, path::Path};
 use dashmap::{DashMap, mapref::entry::Entry};
+use deadpool::managed::BuildError;
 use tower_lsp::lsp_types::{Location, MarkupContent, Url, Position, MarkupKind, Range};
-use tree_sitter::{Point, QueryCursor, QueryCapture};
+use tree_sitter::{Point, QueryCursor, QueryCapture, QueryError};
 
 
 use crate::{parser_pool::{ParserPool, new_pool, ParserManager}, queries::Queries};
@@ -105,17 +106,27 @@ pub fn point(position: Position) -> Point {
     }
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum CacheCreateError {
+    #[error("query")]
+    Query(#[from] QueryError),
+    #[error("pool build")]
+    Pool(#[from] BuildError),
+}
+
+
 impl Cache {
-    pub fn new() -> Self {
+
+    pub fn new() -> std::result::Result<Self, CacheCreateError> {
         let language = tree_sitter_fastbuild::language();
-        let queries = Queries::new(&language).unwrap();
-        let parsers = new_pool(language).unwrap();
-        Cache {
+        let queries = Queries::new(&language)?;
+        let parsers = new_pool(language)?;
+        Ok(Cache {
             declarations: Declarations::new(),
             files: FileCache::default(),
             parsers,
             queries,
-        }
+        })
     }
 
     pub fn load_file(filename: &Path) -> Result<(Url, String)> {
@@ -214,10 +225,4 @@ impl Cache {
             .map_err(|_| Error::Unavailable)
     }
 
-}
-
-impl Default for Cache {
-    fn default() -> Self {
-        Self::new()
-    }
 }
