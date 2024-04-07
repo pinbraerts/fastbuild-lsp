@@ -13,3 +13,14 @@ impl Queries {
         })
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::Queries;
+
+    #[test]
+    fn create() {
+        let language = tree_sitter_fastbuild::language();
+        assert!(Queries::new(&language).is_ok());
+    }
+}
