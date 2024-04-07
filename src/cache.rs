@@ -252,3 +252,42 @@ impl Cache {
     }
 
 }
+
+#[cfg(test)]
+mod tests {
+    use tower_lsp::lsp_types::Url;
+
+    use super::{Cache, Value, FileInformation};
+
+    async fn make_file(uri: impl Into<&str>, content: impl Into<String>) -> Option<FileInformation> {
+        let cache = Cache::new().unwrap();
+        let content: String = content.into();
+        let uri = Url::parse(uri.into()).ok()?;
+        // let uri = Url::parse("memory://inlcude.bff").unwrap();
+        let version = 0;
+        cache.add_file(uri.clone(), content, version).await.ok()?;
+        let file = cache.files.get(&uri)?;
+        Some(file.clone())
+    }
+
+    #[tokio::test]
+    async fn include() {
+        let file = make_file("memory://include.bff", r#"#include "builtins/alias.bff""#).await.expect("should have include");
+        let definition = file.definitions.first_key_value().expect("should have definition");
+        assert_eq!(
+            Value::Include("builtins/alias.bff".to_string()),
+            definition.1.clone()
+        )
+    }
+
+    #[tokio::test]
+    async fn import() {
+        let file = make_file("memory://import.bff", r#"#import HOME"#).await.expect("should have import");
+        let definition = file.definitions.first_key_value().expect("should have definition");
+        assert_eq!(
+            Value::Import { name: "HOME".into(), value: std::env::var("HOME").expect("HOME SHOULD EXIST") },
+            definition.1.clone()
+        )
+    }
+
+}
