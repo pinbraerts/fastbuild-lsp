@@ -5,7 +5,7 @@ use tower_lsp::lsp_types::{Location, MarkupContent, Url, Position, MarkupKind, R
 use tree_sitter::{Point, QueryCursor, QueryCapture, QueryError};
 
 
-use crate::{parser_pool::{ParserPool, new_pool, ParserManager}, queries::Queries};
+use crate::{parser_pool::{ParserPool, new_pool, ParserManager}, queries::Queries, helpers::W};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -49,7 +49,7 @@ impl Declaration {
         Self {
             location: Location {
                 uri: uri.clone(),
-                range: range(capture),
+                range: W(capture).into(),
             },
             documentation: documentation.map(|text| {
                 text.lines()
@@ -76,34 +76,6 @@ pub struct Cache {
     files: FileCache,
     parsers: ParserPool,
     queries: Queries,
-}
-
-fn position(point: Point) -> Position {
-    Position {
-        line: point.row as u32,
-        character: point.column as u32,
-    }
-}
-
-fn range(capture: &QueryCapture) -> Range {
-    Range {
-        start: position(capture.node.start_position()),
-        end:   position(capture.node.end_position()),
-    }
-}
-
-fn content(capture: &QueryCapture, source: &[u8]) -> (Range, String) {
-    (
-        range(capture),
-        capture.node.utf8_text(source).unwrap_or_default().to_owned(),
-    )
-}
-
-pub fn point(position: Position) -> Point {
-    Point {
-       row: position.line as usize,
-        column: position.character as usize,
-    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -206,7 +178,8 @@ impl Cache {
 
     fn get_word(&self, uri: Url, position: Position) -> Option<String> {
         let file = self.files.get(&uri)?;
-        let closest = file.tree.root_node().descendant_for_point_range(point(position), point(position))?;
+        let point = W(&position).into();
+        let closest = file.tree.root_node().descendant_for_point_range(point, point)?;
         match closest.kind() {
             "identifier" => {
                 Some(closest)

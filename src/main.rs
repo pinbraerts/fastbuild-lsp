@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod parser_pool;
 pub mod queries;
+pub mod helpers;
 
 use std::{fs::File, path::Path, collections::HashMap, io};
 
