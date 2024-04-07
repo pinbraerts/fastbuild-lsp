@@ -1,7 +1,8 @@
 use std::{io, fs::File, path::Path, collections::BTreeMap};
 use dashmap::{DashMap, mapref::entry::Entry};
 use deadpool::managed::BuildError;
-use tower_lsp::lsp_types::{Location, MarkupContent, Url, Position, MarkupKind, Range};
+use tower_lsp::lsp_types::{Location, MarkupContent, Position, MarkupKind, Range};
+use url::Url;
 use tracing::trace;
 use tree_sitter::{QueryCursor, QueryCapture, QueryError, Tree, QueryMatch};
 
@@ -28,7 +29,7 @@ impl From<Error> for tower_lsp::jsonrpc::Error {
         match val {
             Error::Json(error) => tower_lsp::jsonrpc::Error::invalid_params(error.to_string()),
             Error::IO(_)       => tower_lsp::jsonrpc::Error::internal_error(),
-            Error::Uri { uri } => tower_lsp::jsonrpc::Error::parse_error(),
+            Error::Uri { .. }  => tower_lsp::jsonrpc::Error::parse_error(),
             Error::TreeSitter  => tower_lsp::jsonrpc::Error::parse_error(),
             Error::Unavailable => tower_lsp::jsonrpc::Error::internal_error(),
         }
@@ -63,16 +64,63 @@ impl Declaration {
 
 pub type Declarations = DashMap::<String, Declaration>;
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Value {
-    Include(String),
-    Import {
-        name: String,
-        value: String,
-    },
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum ExecutionError {
+    #[error("EnvironmentVariable")]
+    EnvironmentVariable(#[from] std::env::VarError),
 }
 
-pub type Definitions = BTreeMap<W<Range>, Value>;
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum Value {
+    String(String),
+    Boolean(bool),
+    Integer(i32),
+    Array(Vec<Value>),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Import {
+    name: String,
+    variable: std::result::Result<Value, std::env::VarError>,
+}
+
+impl Import {
+    fn new(name: impl Into<String>, variable: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            variable: Ok(Value::String(variable.into())),
+        }
+    }
+
+    fn error(name: impl Into<String>, error: impl Into<std::env::VarError>) -> Self {
+        Self {
+            name: name.into(),
+            variable: Err(error.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum UrlError {
+    #[error("file does not exist")]
+    NotExist,
+    #[error("parse")]
+    Parse,
+    #[error("io")]
+    IO,
+    #[error("non-unicode")]
+    NotUnicode,
+}
+
+pub type Include = std::result::Result<Url, UrlError>;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum Decl {
+    Import(Import),
+    Include(Include),
+}
+
+pub type Definitions = BTreeMap<W<Range>, Decl>;
 
 #[derive(Debug, Clone)]
 pub struct FileInformation {
@@ -121,29 +169,41 @@ impl Cache {
         Ok((uri, io::read_to_string(file)?))
     }
 
-    pub fn process_match(m: QueryMatch, names: &[&str], source: &[u8], tree: &Tree) -> Option<(Range, Value)> {
-        let capture = W(m.captures.first()?);
+    pub fn process_match(m: QueryMatch, names: &[&str], source: &[u8]) -> Option<(Range, Decl)> {
+        let capture = m.captures.first()?;
+        let range: Range = W(capture).into();
         let name = names[capture.index as usize];
-        match name {
+        Some((range, match name {
             "include" => {
                 let variable = m.captures.get(1)?;
                 if names[variable.index as usize] != "filename" {
                     return None
                 }
-                let name = variable.node.utf8_text(source).ok()?;
-                Some((capture.into(), Value::Include(name.into())))
+                let mut current = std::env::current_dir().ok()?;
+                let path = match variable.node.utf8_text(source) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        return Some((range, Decl::Include(Err(UrlError::NotUnicode))));
+                    },
+                };
+                current.push(path);
+                if !current.exists() {
+                    return Some((range, Decl::Include(Err(UrlError::NotExist))));
+                }
+                let url = Url::from_file_path(current).map_err(|_| UrlError::Parse);
+                Decl::Include(url)
             },
             "import"  => {
                 let variable = m.captures.get(1)?;
                 if names[variable.index as usize] != "variable" {
                     return None
                 }
-                let name = variable.node.utf8_text(source).ok()?;
-                let value = std::env::var(name).ok()?;
-                Some((capture.into(), Value::Import { name: name.into(), value }))
+                let name = variable.node.utf8_text(source).ok()?.to_string();
+                let variable = std::env::var(name.as_str()).map(Value::String);
+                Decl::Import(Import { name, variable })
             },
-            _ => None,
-        }
+            _ => { return None; },
+        }))
     }
 
     pub fn preprocess(&self, source: &[u8], tree: &Tree, definitions: &mut Definitions) -> Result<()> {
@@ -151,7 +211,7 @@ impl Cache {
         QueryCursor::new()
             .matches(&self.queries.preprocessor, tree.root_node(), source)
             .for_each(|m| {
-                if let Some((range, value)) = Self::process_match(m, names, source, tree) {
+                if let Some((range, value)) = Self::process_match(m, names, source) {
                     definitions.insert(W(range), value);
                 }
             });
@@ -255,9 +315,13 @@ impl Cache {
 
 #[cfg(test)]
 mod tests {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
     use tower_lsp::lsp_types::Url;
 
-    use super::{Cache, Value, FileInformation};
+    use crate::cache::{Decl, Import, UrlError};
+
+    use super::{Cache, FileInformation};
 
     async fn make_file(uri: impl Into<&str>, content: impl Into<String>) -> Option<FileInformation> {
         let cache = Cache::new().unwrap();
@@ -274,8 +338,32 @@ mod tests {
     async fn include() {
         let file = make_file("memory://include.bff", r#"#include "builtins/alias.bff""#).await.expect("should have include");
         let definition = file.definitions.first_key_value().expect("should have definition");
+        let mut path = std::env::current_dir().expect("should have current dir");
+        path.push("builtins/alias.bff");
         assert_eq!(
-            Value::Include("builtins/alias.bff".to_string()),
+            Decl::Include(Url::from_file_path(path).map_err(|_| UrlError::Parse)),
+            definition.1.clone()
+        )
+    }
+
+    #[tokio::test]
+    async fn include_braces() {
+        let file = make_file("memory://include.bff", r#"#include <builtins/alias.bff>"#).await.expect("should have include");
+        let definition = file.definitions.first_key_value().expect("should have definition");
+        let mut path = std::env::current_dir().expect("should have current dir");
+        path.push("builtins/alias.bff");
+        assert_eq!(
+            Decl::Include(Url::from_file_path(path).map_err(|_| UrlError::Parse)),
+            definition.1.clone()
+        )
+    }
+
+    #[tokio::test]
+    async fn include_does_not_exist() {
+        let file = make_file("memory://include.bff", r#"#include <not_exist>"#).await.expect("should have include");
+        let definition = file.definitions.first_key_value().expect("should have definition");
+        assert_eq!(
+            Decl::Include(Err(UrlError::NotExist)),
             definition.1.clone()
         )
     }
@@ -285,7 +373,29 @@ mod tests {
         let file = make_file("memory://import.bff", r#"#import HOME"#).await.expect("should have import");
         let definition = file.definitions.first_key_value().expect("should have definition");
         assert_eq!(
-            Value::Import { name: "HOME".into(), value: std::env::var("HOME").expect("HOME SHOULD EXIST") },
+            Decl::Import(Import::new("HOME", std::env::var("HOME").expect("HOME should be defined"))),
+            definition.1.clone()
+        )
+    }
+
+    #[tokio::test]
+    async fn import_not_present() {
+        let file = make_file("memory://import.bff", r#"#import not_present"#).await.expect("should have import");
+        let definition = file.definitions.first_key_value().expect("should have definition");
+        assert_eq!(
+            Decl::Import(Import::error("not_present", std::env::VarError::NotPresent)),
+            definition.1.clone()
+        )
+    }
+
+    #[tokio::test]
+    async fn import_not_unicode() {
+        let non_unicode = OsString::from_vec(vec![255]);
+        std::env::set_var("not_unicode", non_unicode.clone());
+        let file = make_file("memory://import.bff", r#"#import not_unicode"#).await.expect("should have import");
+        let definition = file.definitions.first_key_value().expect("should have definition");
+        assert_eq!(
+            Decl::Import(Import::error("not_unicode", std::env::VarError::NotUnicode(non_unicode))),
             definition.1.clone()
         )
     }
