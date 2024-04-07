@@ -96,7 +96,7 @@ async fn main() {
     let args : Vec<String> = std::env::args().collect();
 
     let filename = args
-        .first()
+        .get(1)
         .cloned()
         .unwrap_or_else(|| "/home/pinbraerts/src/fastbuild-lsp/log.log".to_string());
     if let Ok(file) = File::create(filename) {
