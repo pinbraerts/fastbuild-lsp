@@ -1,8 +1,9 @@
-use std::{io, fs::File, path::Path};
+use std::{io, fs::File, path::Path, collections::BTreeMap};
 use dashmap::{DashMap, mapref::entry::Entry};
 use deadpool::managed::BuildError;
 use tower_lsp::lsp_types::{Location, MarkupContent, Url, Position, MarkupKind, Range};
-use tree_sitter::{Point, QueryCursor, QueryCapture, QueryError};
+use tracing::trace;
+use tree_sitter::{QueryCursor, QueryCapture, QueryError, Tree, QueryMatch};
 
 
 use crate::{parser_pool::{ParserPool, new_pool, ParserManager}, queries::Queries, helpers::W};
@@ -39,7 +40,7 @@ pub fn markdown(value: String) -> MarkupContent {
     MarkupContent { kind: MarkupKind::Markdown, value }
 }
 
-struct Declaration {
+pub struct Declaration {
     location: Location,
     documentation: Option<MarkupContent>,
 }
@@ -62,11 +63,23 @@ impl Declaration {
 
 pub type Declarations = DashMap::<String, Declaration>;
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum Value {
+    Include(String),
+    Import {
+        name: String,
+        value: String,
+    },
+}
+
+pub type Definitions = BTreeMap<W<Range>, Value>;
+
 #[derive(Debug, Clone)]
 pub struct FileInformation {
     pub content: String,
     pub version: i32,
     pub tree: tree_sitter::Tree,
+    pub definitions: Definitions,
 }
 
 pub type FileCache = DashMap<Url, FileInformation>;
@@ -108,7 +121,45 @@ impl Cache {
         Ok((uri, io::read_to_string(file)?))
     }
 
+    pub fn process_match(m: QueryMatch, names: &[&str], source: &[u8], tree: &Tree) -> Option<(Range, Value)> {
+        let capture = W(m.captures.first()?);
+        let name = names[capture.index as usize];
+        match name {
+            "include" => {
+                let variable = m.captures.get(1)?;
+                if names[variable.index as usize] != "filename" {
+                    return None
+                }
+                let name = variable.node.utf8_text(source).ok()?;
+                Some((capture.into(), Value::Include(name.into())))
+            },
+            "import"  => {
+                let variable = m.captures.get(1)?;
+                if names[variable.index as usize] != "variable" {
+                    return None
+                }
+                let name = variable.node.utf8_text(source).ok()?;
+                let value = std::env::var(name).ok()?;
+                Some((capture.into(), Value::Import { name: name.into(), value }))
+            },
+            _ => None,
+        }
+    }
+
+    pub fn preprocess(&self, source: &[u8], tree: &Tree, definitions: &mut Definitions) -> Result<()> {
+        let names = self.queries.preprocessor.capture_names();
+        QueryCursor::new()
+            .matches(&self.queries.preprocessor, tree.root_node(), source)
+            .for_each(|m| {
+                if let Some((range, value)) = Self::process_match(m, names, source, tree) {
+                    definitions.insert(W(range), value);
+                }
+            });
+        Ok(())
+    }
+
     pub async fn add_file(&self, uri: Url, content: String, version: i32) -> Result<()> {
+        trace!("processing file {:?}", uri);
         let entry = self.files.entry(uri.clone());
         let tree = match &entry {
             Entry::Occupied(occupied) => {
@@ -134,6 +185,9 @@ impl Cache {
         let source = content.as_bytes();
         let names = &self.queries.function_definition.capture_names();
 
+        let mut definitions = Definitions::new();
+        let _ = self.preprocess(source, &tree, &mut definitions);
+
         QueryCursor::new()
             .matches(&self.queries.function_definition, tree.root_node(), source)
             .for_each(|m| {
@@ -158,8 +212,7 @@ impl Cache {
                     Declaration::new(&uri, definition, documentation)
                 );
             });
-
-        entry.insert(FileInformation { content, tree, version });
+        entry.insert(FileInformation { content, tree, version, definitions });
         Ok(())
     }
 
