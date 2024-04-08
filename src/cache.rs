@@ -179,20 +179,7 @@ impl Cache {
     }
 
     pub fn preprocess(&self, file: &mut FileInformation) {
-        QueryCursor::new()
-            .matches(&self.queries.preprocessor.0, file.tree.root_node(), file.content.as_bytes())
-            .map(|m| self.queries.preprocessor.parse(file.content.as_bytes(), m))
-            .for_each(|(n, p)| {
-                match p {
-                    Preprocessor::Include(filename) => {
-                        file.definitions.insert(W(W(&n).into()), Decl::Include(Self::find_file(filename)));
-                    },
-                    Preprocessor::Import(variable) => {
-                        file.definitions.insert(W(W(&n).into()), Decl::Import(Self::find_environment_variable(variable)));
-                    }
-                    _ => { },
-                }
-            });
+        
     }
 
     pub fn add_file(&self, parser: &mut Parser, uri: Url, content: String, version: i32) -> Result<()> {
@@ -218,17 +205,37 @@ impl Cache {
             .parse(&content, tree)
             .ok_or(Error::TreeSitter)?;
 
-        let definitions = Definitions::new();
-        let mut file = entry.insert(FileInformation { content, tree, version, definitions, once: false });
-        self.preprocess(&mut file);
+        let mut definitions = Definitions::new();
+        let source = content.as_bytes();
+        let mut once = false;
 
         QueryCursor::new()
-            .matches(&self.queries.function_definition.0, file.tree.root_node(), file.content.as_bytes())
-            .map(|m| self.queries.function_definition.parse(file.content.as_bytes(), m))
+            .matches(&self.queries.preprocessor.0, tree.root_node(), source)
+            .map(|m| self.queries.preprocessor.parse(source, m))
+            .for_each(|(n, p)| {
+                match p {
+                    Preprocessor::Include(filename) => {
+                        definitions.insert(W(W(&n).into()), Decl::Include(Self::find_file(filename)));
+                    },
+                    Preprocessor::Import(variable) => {
+                        definitions.insert(W(W(&n).into()), Decl::Import(Self::find_environment_variable(variable)));
+                    }
+                    Preprocessor::Once => {
+                        once = true;
+                    }
+                    _ => { },
+                }
+            });
+
+        QueryCursor::new()
+            .matches(&self.queries.function_definition.0, tree.root_node(), source)
+            .map(|m| self.queries.function_definition.parse(source, m))
             .for_each(|(n, f)| {
                 self.declarations.insert(f.name.to_string(), Declaration::new(&uri, &n, f.documentation));
             })
         ;
+        
+        entry.insert(FileInformation { content, tree, version, definitions, once });
 
         Ok(())
     }
@@ -293,6 +300,7 @@ mod tests {
         let definition = file.definitions.first_key_value().expect("should have definition");
         let mut path = std::env::current_dir().expect("should have current dir");
         path.push("builtins/alias.bff");
+        assert!(!file.once);
         assert_eq!(
             Decl::Include(Url::from_file_path(path).map_err(|_| UrlError::Parse)),
             definition.1.clone()
@@ -305,6 +313,7 @@ mod tests {
         let definition = file.definitions.first_key_value().expect("should have definition");
         let mut path = std::env::current_dir().expect("should have current dir");
         path.push("builtins/alias.bff");
+        assert!(!file.once);
         assert_eq!(
             Decl::Include(Url::from_file_path(path).map_err(|_| UrlError::Parse)),
             definition.1.clone()
@@ -315,6 +324,7 @@ mod tests {
     fn include_does_not_exist() {
         let (cache, file) = make_file("memory://include.bff", r#"#include <not_exist>"#).expect("should have include");
         let definition = file.definitions.first_key_value().expect("should have definition");
+        assert!(!file.once);
         assert_eq!(
             Decl::Include(Err(UrlError::NotExist)),
             definition.1.clone()
@@ -325,10 +335,17 @@ mod tests {
     fn import() {
         let (cache, file) = make_file("memory://import.bff", r#"#import HOME"#).expect("should have import");
         let definition = file.definitions.first_key_value().expect("should have definition");
+        assert!(!file.once);
         assert_eq!(
             Decl::Import(Import::new("HOME", std::env::var("HOME").expect("HOME should be defined"))),
             definition.1.clone()
         )
+    }
+
+    #[test]
+    fn once() {
+        let (cache, file) = make_file("memory://once.bff", "#once").expect("should have import");
+        assert!(file.once);
     }
 
     #[test]
