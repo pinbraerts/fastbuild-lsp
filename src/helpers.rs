@@ -1,5 +1,5 @@
 use tower_lsp::lsp_types::{Range, Position};
-use tree_sitter::{QueryCapture, Point};
+use tree_sitter::{QueryCapture, Point, Node};
 use std::ops::Deref;
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Default)]
@@ -31,11 +31,11 @@ impl From<W<&Position>> for Point {
     }
 }
 
-impl<'tree> From<W<&QueryCapture<'tree>>> for Range {
-    fn from(value: W<&QueryCapture>) -> Self {
+impl<'tree> From<W<&Node<'tree>>> for Range {
+    fn from(value: W<&Node>) -> Self {
         Self {
-            start: W(&value.node.start_position()).into(),
-            end:   W(&value.node.end_position()).into(),
+            start: W(&value.start_position()).into(),
+            end:   W(&value.end_position()).into(),
         }
     }
 }
