@@ -4,7 +4,7 @@ use deadpool::managed::BuildError;
 use tower_lsp::lsp_types::{Location, MarkupContent, Position, MarkupKind, Range};
 use url::Url;
 use tracing::trace;
-use tree_sitter::{QueryCursor, QueryCapture, QueryError, Tree, QueryMatch};
+use tree_sitter::{QueryCursor, QueryCapture, QueryError, Tree, QueryMatch, Node};
 
 use crate::{parser_pool::{ParserPool, new_pool, ParserManager}, queries::{Queries, Preprocessor}, helpers::W};
 
@@ -40,23 +40,22 @@ pub fn markdown(value: String) -> MarkupContent {
     MarkupContent { kind: MarkupKind::Markdown, value }
 }
 
+#[derive(Debug, Eq, PartialEq)]
 pub struct Declaration {
     location: Location,
-    documentation: Option<MarkupContent>,
+    documentation: MarkupContent,
 }
 
 impl Declaration {
-    fn new(uri: &Url, capture: &QueryCapture, documentation: Option<&str>) -> Self {
+    fn new(uri: &Url, node: &Node, documentation: Vec<&str>) -> Self {
         Self {
             location: Location {
                 uri: uri.clone(),
-                range: W(&capture.node).into(),
+                range: W(node).into(),
             },
-            documentation: documentation.map(|text| {
-                text.lines()
-                    .map(|line| line.get(3..line.len()).unwrap_or_default())
-                    .fold(String::new(), |a, b| a + b + "\n")
-            }).map(markdown),
+            documentation: markdown(documentation.iter()
+                .map(|line| line.get(3..line.len()).unwrap_or_default())
+                .fold(String::new(), |a, b| a + b + "\n")),
         }
     }
 }
@@ -127,6 +126,7 @@ pub struct FileInformation {
     pub version: i32,
     pub tree: tree_sitter::Tree,
     pub definitions: Definitions,
+    pub once: bool,
 }
 
 pub type FileCache = DashMap<Url, FileInformation>;
@@ -182,17 +182,17 @@ impl Cache {
         Import { name: name.to_string(), variable }
     }
 
-    pub fn preprocess(&self, source: &[u8], tree: &Tree, definitions: &mut Definitions) {
+    pub fn preprocess(&self, file: &mut FileInformation) {
         QueryCursor::new()
-            .matches(&self.queries.preprocessor.0, tree.root_node(), source)
-            .map(|m| self.queries.preprocessor.parse(source, m))
+            .matches(&self.queries.preprocessor.0, file.tree.root_node(), file.content.as_bytes())
+            .map(|m| self.queries.preprocessor.parse(file.content.as_bytes(), m))
             .for_each(|(n, p)| {
                 match p {
                     Preprocessor::Include(filename) => {
-                        definitions.insert(W(W(&n).into()), Decl::Include(Self::find_file(filename)));
+                        file.definitions.insert(W(W(&n).into()), Decl::Include(Self::find_file(filename)));
                     },
                     Preprocessor::Import(variable) => {
-                        definitions.insert(W(W(&n).into()), Decl::Import(Self::find_environment_variable(variable)));
+                        file.definitions.insert(W(W(&n).into()), Decl::Import(Self::find_environment_variable(variable)));
                     }
                     _ => { },
                 }
@@ -223,37 +223,18 @@ impl Cache {
             .parse(&content, tree)
             .ok_or(Error::TreeSitter)?;
 
-        let source = content.as_bytes();
-        let names = &self.queries.function_definition.capture_names();
-
-        let mut definitions = Definitions::new();
-        self.preprocess(source, &tree, &mut definitions);
+        let definitions = Definitions::new();
+        let mut file = entry.insert(FileInformation { content, tree, version, definitions, once: false });
+        self.preprocess(&mut file);
 
         QueryCursor::new()
-            .matches(&self.queries.function_definition, tree.root_node(), source)
-            .for_each(|m| {
-                let documentation = m.captures
-                    .iter()
-                    .find(|c| names[c.index as usize] == "documentation")
-                    .map(|c| c.node.utf8_text(source).unwrap_or_default())
-                ;
-                let definition = m.captures
-                    .iter()
-                    .find(|c| names[c.index as usize] == "name");
-                let definition = match definition {
-                    Some(d) => d,
-                    None => { return; },
-                };
-                let text = match definition.node.utf8_text(source) {
-                    Ok(text) => text.to_owned(),
-                    Err(_) => { return; },
-                };
-                self.declarations.insert(
-                    text,
-                    Declaration::new(&uri, definition, documentation)
-                );
-            });
-        entry.insert(FileInformation { content, tree, version, definitions });
+            .matches(&self.queries.function_definition.0, file.tree.root_node(), file.content.as_bytes())
+            .map(|m| self.queries.function_definition.parse(file.content.as_bytes(), m))
+            .for_each(|(n, f)| {
+                self.declarations.insert(f.name.to_string(), Declaration::new(&uri, &n, f.documentation));
+            })
+        ;
+
         Ok(())
     }
 
@@ -267,7 +248,6 @@ impl Cache {
         self.declarations
             .get(&self.get_word(uri, position)?)
             .map(|reference| reference.documentation.clone())
-            .unwrap_or(None)
     }
 
     fn get_word(&self, uri: Url, position: Position) -> Option<String> {
@@ -296,28 +276,28 @@ impl Cache {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt, ops::Deref};
 
-    use tower_lsp::lsp_types::Url;
+    use tower_lsp::lsp_types::{Url, lsif::LocationOrRangeId, MarkupContent, DeclarationCapability, Location, Range, Position};
 
-    use crate::cache::{Decl, Import, UrlError};
+    use crate::cache::{Decl, Import, UrlError, Declaration};
 
     use super::{Cache, FileInformation};
 
-    async fn make_file(uri: impl Into<&str>, content: impl Into<String>) -> Option<FileInformation> {
+    async fn make_file(uri: impl Into<&str>, content: impl Into<String>) -> Option<(Cache, FileInformation)> {
         let cache = Cache::new().unwrap();
         let content: String = content.into();
         let uri = Url::parse(uri.into()).ok()?;
         // let uri = Url::parse("memory://inlcude.bff").unwrap();
         let version = 0;
         cache.add_file(uri.clone(), content, version).await.ok()?;
-        let file = cache.files.get(&uri)?;
-        Some(file.clone())
+        let file = cache.files.get(&uri)?.clone();
+        Some((cache, file))
     }
 
     #[tokio::test]
     async fn include() {
-        let file = make_file("memory://include.bff", r#"#include "builtins/alias.bff""#).await.expect("should have include");
+        let (cache, file) = make_file("memory://include.bff", r#"#include "builtins/alias.bff""#).await.expect("should have include");
         let definition = file.definitions.first_key_value().expect("should have definition");
         let mut path = std::env::current_dir().expect("should have current dir");
         path.push("builtins/alias.bff");
@@ -329,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn include_braces() {
-        let file = make_file("memory://include.bff", r#"#include <builtins/alias.bff>"#).await.expect("should have include");
+        let (cache, file) = make_file("memory://include.bff", r#"#include <builtins/alias.bff>"#).await.expect("should have include");
         let definition = file.definitions.first_key_value().expect("should have definition");
         let mut path = std::env::current_dir().expect("should have current dir");
         path.push("builtins/alias.bff");
@@ -341,7 +321,7 @@ mod tests {
 
     #[tokio::test]
     async fn include_does_not_exist() {
-        let file = make_file("memory://include.bff", r#"#include <not_exist>"#).await.expect("should have include");
+        let (cache, file) = make_file("memory://include.bff", r#"#include <not_exist>"#).await.expect("should have include");
         let definition = file.definitions.first_key_value().expect("should have definition");
         assert_eq!(
             Decl::Include(Err(UrlError::NotExist)),
@@ -351,7 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn import() {
-        let file = make_file("memory://import.bff", r#"#import HOME"#).await.expect("should have import");
+        let (cache, file) = make_file("memory://import.bff", r#"#import HOME"#).await.expect("should have import");
         let definition = file.definitions.first_key_value().expect("should have definition");
         assert_eq!(
             Decl::Import(Import::new("HOME", std::env::var("HOME").expect("HOME should be defined"))),
@@ -361,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_not_present() {
-        let file = make_file("memory://import.bff", r#"#import not_present"#).await.expect("should have import");
+        let (cache, file) = make_file("memory://import.bff", r#"#import not_present"#).await.expect("should have import");
         let definition = file.definitions.first_key_value().expect("should have definition");
         assert_eq!(
             Decl::Import(Import::error("not_present", std::env::VarError::NotPresent)),
@@ -373,11 +353,55 @@ mod tests {
     async fn import_not_unicode() {
         let non_unicode = OsString::from_vec(vec![255]);
         std::env::set_var("not_unicode", non_unicode.clone());
-        let file = make_file("memory://import.bff", r#"#import not_unicode"#).await.expect("should have import");
+        let (cache, file) = make_file("memory://import.bff", r#"#import not_unicode"#).await.expect("should have import");
         let definition = file.definitions.first_key_value().expect("should have definition");
         assert_eq!(
             Decl::Import(Import::error("not_unicode", std::env::VarError::NotUnicode(non_unicode))),
             definition.1.clone()
+        )
+    }
+
+    #[tokio::test]
+    async fn function_definition() {
+        let (cache, file) = make_file("memory://function.bff", "function f() {}").await.expect("should be correct");
+        let definition = cache.declarations.get("f").unwrap();
+        assert_eq!(
+            *definition.deref(),
+            Declaration {
+                location: Location {
+                    uri: Url::parse("memory://function.bff").unwrap(),
+                    range: Range {
+                        start: Position::new(0, 0),
+                        end: Position::new(0, 15),
+                    },
+                },
+                documentation: MarkupContent {
+                    kind: tower_lsp::lsp_types::MarkupKind::Markdown,
+                    value: "".to_string(),
+                },
+            }
+        )
+    }
+
+    #[tokio::test]
+    async fn function_definition_with_documentation() {
+        let (cache, file) = make_file("memory://function.bff", "// docs\nfunction f() {}").await.expect("should be correct");
+        let definition = cache.declarations.get("f").unwrap();
+        assert_eq!(
+            *definition.deref(),
+            Declaration {
+                location: Location {
+                    uri: Url::parse("memory://function.bff").unwrap(),
+                    range: Range {
+                        start: Position::new(1, 0),
+                        end: Position::new(1, 15),
+                    },
+                },
+                documentation: MarkupContent {
+                    kind: tower_lsp::lsp_types::MarkupKind::Markdown,
+                    value: "docs\n".to_string(),
+                },
+            }
         )
     }
 
