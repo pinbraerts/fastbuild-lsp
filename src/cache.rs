@@ -4,7 +4,7 @@ use deadpool::managed::BuildError;
 use tower_lsp::lsp_types::{Location, MarkupContent, Position, MarkupKind, Range};
 use url::Url;
 use tracing::trace;
-use tree_sitter::{QueryCursor, QueryCapture, QueryError, Tree, QueryMatch, Node};
+use tree_sitter::{QueryCursor, QueryCapture, QueryError, Tree, QueryMatch, Node, Language, Parser};
 
 use crate::{parser_pool::{ParserPool, new_pool, ParserManager}, queries::{Queries, Preprocessor}, helpers::W};
 
@@ -134,7 +134,6 @@ pub type FileCache = DashMap<Url, FileInformation>;
 pub struct Cache {
     declarations: Declarations,
     files: FileCache,
-    parsers: ParserPool,
     queries: Queries,
 }
 
@@ -149,14 +148,11 @@ pub enum CacheCreateError {
 
 impl Cache {
 
-    pub fn new() -> std::result::Result<Self, CacheCreateError> {
-        let language = tree_sitter_fastbuild::language();
-        let queries = Queries::new(&language)?;
-        let parsers = new_pool(language)?;
+    pub fn new(language: &Language) -> std::result::Result<Self, CacheCreateError> {
+        let queries = Queries::new(language)?;
         Ok(Cache {
             declarations: Declarations::new(),
             files: FileCache::default(),
-            parsers,
             queries,
         })
     }
@@ -199,7 +195,7 @@ impl Cache {
             });
     }
 
-    pub async fn add_file(&self, uri: Url, content: String, version: i32) -> Result<()> {
+    pub fn add_file(&self, parser: &mut Parser, uri: Url, content: String, version: i32) -> Result<()> {
         trace!("processing file {:?}", uri);
         let entry = self.files.entry(uri.clone());
         let tree = match &entry {
@@ -218,8 +214,7 @@ impl Cache {
             Entry::Vacant(_) => None,
         };
 
-        let tree = self.get_parser()
-            .await?
+        let tree = parser
             .parse(&content, tree)
             .ok_or(Error::TreeSitter)?;
 
@@ -265,13 +260,6 @@ impl Cache {
         }?.utf8_text(file.content.as_bytes()).ok().map(|s| s.to_owned())
     }
 
-    async fn get_parser(&self) -> Result<deadpool::managed::Object<ParserManager>> {
-        self.parsers
-            .get()
-            .await
-            .map_err(|_| Error::Unavailable)
-    }
-
 }
 
 #[cfg(test)]
@@ -279,25 +267,29 @@ mod tests {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt, ops::Deref};
 
     use tower_lsp::lsp_types::{Url, lsif::LocationOrRangeId, MarkupContent, DeclarationCapability, Location, Range, Position};
+    use tree_sitter::Parser;
 
     use crate::cache::{Decl, Import, UrlError, Declaration};
 
     use super::{Cache, FileInformation};
 
-    async fn make_file(uri: impl Into<&str>, content: impl Into<String>) -> Option<(Cache, FileInformation)> {
-        let cache = Cache::new().unwrap();
+    fn make_file<'a>(uri: impl Into<&'a str>, content: impl Into<String>) -> Option<(Cache, FileInformation)> {
+        let language = tree_sitter_fastbuild::language();
+        let mut parser = Parser::new();
+        parser.set_language(&language).ok()?;
+        let cache = Cache::new(&language).unwrap();
         let content: String = content.into();
         let uri = Url::parse(uri.into()).ok()?;
         // let uri = Url::parse("memory://inlcude.bff").unwrap();
         let version = 0;
-        cache.add_file(uri.clone(), content, version).await.ok()?;
+        cache.add_file(&mut parser, uri.clone(), content, version).ok()?;
         let file = cache.files.get(&uri)?.clone();
         Some((cache, file))
     }
 
-    #[tokio::test]
-    async fn include() {
-        let (cache, file) = make_file("memory://include.bff", r#"#include "builtins/alias.bff""#).await.expect("should have include");
+    #[test]
+    fn include() {
+        let (cache, file) = make_file("memory://include.bff", r#"#include "builtins/alias.bff""#).expect("should have include");
         let definition = file.definitions.first_key_value().expect("should have definition");
         let mut path = std::env::current_dir().expect("should have current dir");
         path.push("builtins/alias.bff");
@@ -307,9 +299,9 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn include_braces() {
-        let (cache, file) = make_file("memory://include.bff", r#"#include <builtins/alias.bff>"#).await.expect("should have include");
+    #[test]
+    fn include_braces() {
+        let (cache, file) = make_file("memory://include.bff", r#"#include <builtins/alias.bff>"#).expect("should have include");
         let definition = file.definitions.first_key_value().expect("should have definition");
         let mut path = std::env::current_dir().expect("should have current dir");
         path.push("builtins/alias.bff");
@@ -319,9 +311,9 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn include_does_not_exist() {
-        let (cache, file) = make_file("memory://include.bff", r#"#include <not_exist>"#).await.expect("should have include");
+    #[test]
+    fn include_does_not_exist() {
+        let (cache, file) = make_file("memory://include.bff", r#"#include <not_exist>"#).expect("should have include");
         let definition = file.definitions.first_key_value().expect("should have definition");
         assert_eq!(
             Decl::Include(Err(UrlError::NotExist)),
@@ -329,9 +321,9 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn import() {
-        let (cache, file) = make_file("memory://import.bff", r#"#import HOME"#).await.expect("should have import");
+    #[test]
+    fn import() {
+        let (cache, file) = make_file("memory://import.bff", r#"#import HOME"#).expect("should have import");
         let definition = file.definitions.first_key_value().expect("should have definition");
         assert_eq!(
             Decl::Import(Import::new("HOME", std::env::var("HOME").expect("HOME should be defined"))),
@@ -339,9 +331,9 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn import_not_present() {
-        let (cache, file) = make_file("memory://import.bff", r#"#import not_present"#).await.expect("should have import");
+    #[test]
+    fn import_not_present() {
+        let (cache, file) = make_file("memory://import.bff", r#"#import not_present"#).expect("should have import");
         let definition = file.definitions.first_key_value().expect("should have definition");
         assert_eq!(
             Decl::Import(Import::error("not_present", std::env::VarError::NotPresent)),
@@ -349,11 +341,11 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn import_not_unicode() {
+    #[test]
+    fn import_not_unicode() {
         let non_unicode = OsString::from_vec(vec![255]);
         std::env::set_var("not_unicode", non_unicode.clone());
-        let (cache, file) = make_file("memory://import.bff", r#"#import not_unicode"#).await.expect("should have import");
+        let (cache, file) = make_file("memory://import.bff", r#"#import not_unicode"#).expect("should have import");
         let definition = file.definitions.first_key_value().expect("should have definition");
         assert_eq!(
             Decl::Import(Import::error("not_unicode", std::env::VarError::NotUnicode(non_unicode))),
@@ -361,9 +353,9 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn function_definition() {
-        let (cache, file) = make_file("memory://function.bff", "function f() {}").await.expect("should be correct");
+    #[test]
+    fn function_definition() {
+        let (cache, file) = make_file("memory://function.bff", "function f() {}").expect("should be correct");
         let definition = cache.declarations.get("f").unwrap();
         assert_eq!(
             *definition.deref(),
@@ -383,9 +375,9 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn function_definition_with_documentation() {
-        let (cache, file) = make_file("memory://function.bff", "// docs\nfunction f() {}").await.expect("should be correct");
+    #[test]
+    fn function_definition_with_documentation() {
+        let (cache, file) = make_file("memory://function.bff", "// docs\nfunction f() {}").expect("should be correct");
         let definition = cache.declarations.get("f").unwrap();
         assert_eq!(
             *definition.deref(),

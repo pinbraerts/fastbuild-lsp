@@ -3,9 +3,11 @@ pub mod parser_pool;
 pub mod queries;
 pub mod helpers;
 
+use std::ops::{Deref, DerefMut};
 use std::{fs::File, path::Path, collections::HashMap, io};
 
 use cache::Cache;
+use parser_pool::{ParserPool, ParserManager};
 use tower_lsp::lsp_types::{InitializeResult, InitializedParams, MessageType};
 use tower_lsp::{Client, LanguageServer, Server, LspService};
 use tower_lsp::lsp_types::*;
@@ -14,10 +16,12 @@ use tower_lsp::jsonrpc::{Error, Result};
 use tracing::{info, debug, Level, error, trace, warn};
 
 use crate::cache::FileCache;
+use crate::parser_pool::new_pool;
 
 struct Backend {
     client: Client,
     cache: Cache,
+    parsers: ParserPool,
 }
 
 #[tower_lsp::async_trait]
@@ -73,7 +77,11 @@ impl LanguageServer for Backend {
         if document.language_id != "fastbuild" {
             return;
         }
-        let _ = self.cache.add_file(document.uri, document.text, document.version).await;
+        let mut parser = match self.parsers.get().await {
+            Ok(x) => x,
+            Err(_) => { return; },
+        };
+        let _ = self.cache.add_file(parser.deref_mut(), document.uri, document.text, document.version);
     }
 
     async fn did_change(&self, mut params: DidChangeTextDocumentParams) {
@@ -83,7 +91,11 @@ impl LanguageServer for Backend {
             warn!("file changes: {:?}", params.content_changes);
             return;
         }
-        let _ = self.cache.add_file(document.uri, std::mem::take(&mut params.content_changes[0].text), document.version).await;
+        let mut parser = match self.parsers.get().await {
+            Ok(x) => x,
+            Err(_) => { return; },
+        };
+        let _ = self.cache.add_file(parser.deref_mut(), document.uri, std::mem::take(&mut params.content_changes[0].text), document.version);
     }
 
 }
@@ -111,14 +123,19 @@ async fn main() {
     let path = Path::new("/home/pinbraerts/src/fastbuild-lsp/builtins/alias.bff");
     let (url, content) = Cache::load_file(path).unwrap();
 
+    let language = tree_sitter_fastbuild::language();
+    let parsers = new_pool(language.clone()).expect("failed to create language");
+    let mut parser = parsers.get().await.expect("parser is unavailable");
+
     info!("creating cache");
-    let cache = Cache::new().unwrap();
-    cache.add_file(url, content, 0).await.unwrap();
+    let cache = Cache::new(&language).unwrap();
+    cache.add_file(parser.as_mut(), url, content, 0).unwrap();
 
     info!("starting LSP server");
     let (service, socket) = LspService::new(|client| Backend {
         client,
         cache,
+        parsers,
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
