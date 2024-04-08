@@ -6,8 +6,7 @@ use url::Url;
 use tracing::trace;
 use tree_sitter::{QueryCursor, QueryCapture, QueryError, Tree, QueryMatch};
 
-
-use crate::{parser_pool::{ParserPool, new_pool, ParserManager}, queries::Queries, helpers::W};
+use crate::{parser_pool::{ParserPool, new_pool, ParserManager}, queries::{Queries, Preprocessor}, helpers::W};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -51,7 +50,7 @@ impl Declaration {
         Self {
             location: Location {
                 uri: uri.clone(),
-                range: W(capture).into(),
+                range: W(&capture.node).into(),
             },
             documentation: documentation.map(|text| {
                 text.lines()
@@ -169,53 +168,35 @@ impl Cache {
         Ok((uri, io::read_to_string(file)?))
     }
 
-    pub fn process_match(m: QueryMatch, names: &[&str], source: &[u8]) -> Option<(Range, Decl)> {
-        let capture = m.captures.first()?;
-        let range: Range = W(capture).into();
-        let name = names[capture.index as usize];
-        Some((range, match name {
-            "include" => {
-                let variable = m.captures.get(1)?;
-                if names[variable.index as usize] != "filename" {
-                    return None
-                }
-                let mut current = std::env::current_dir().ok()?;
-                let path = match variable.node.utf8_text(source) {
-                    Ok(path) => path,
-                    Err(_) => {
-                        return Some((range, Decl::Include(Err(UrlError::NotUnicode))));
-                    },
-                };
-                current.push(path);
-                if !current.exists() {
-                    return Some((range, Decl::Include(Err(UrlError::NotExist))));
-                }
-                let url = Url::from_file_path(current).map_err(|_| UrlError::Parse);
-                Decl::Include(url)
-            },
-            "import"  => {
-                let variable = m.captures.get(1)?;
-                if names[variable.index as usize] != "variable" {
-                    return None
-                }
-                let name = variable.node.utf8_text(source).ok()?.to_string();
-                let variable = std::env::var(name.as_str()).map(Value::String);
-                Decl::Import(Import { name, variable })
-            },
-            _ => { return None; },
-        }))
+    fn find_file(filename: &str) -> Include {
+        let mut current = std::env::current_dir().map_err(|_| UrlError::Parse)?;
+        current.push(filename);
+        if !current.exists() {
+            return Err(UrlError::NotExist)
+        }
+        Url::from_file_path(current).map_err(|_| UrlError::Parse)
     }
 
-    pub fn preprocess(&self, source: &[u8], tree: &Tree, definitions: &mut Definitions) -> Result<()> {
-        let names = self.queries.preprocessor.capture_names();
+    fn find_environment_variable(name: &str) -> Import {
+        let variable = std::env::var(name).map(Value::String);
+        Import { name: name.to_string(), variable }
+    }
+
+    pub fn preprocess(&self, source: &[u8], tree: &Tree, definitions: &mut Definitions) {
         QueryCursor::new()
-            .matches(&self.queries.preprocessor, tree.root_node(), source)
-            .for_each(|m| {
-                if let Some((range, value)) = Self::process_match(m, names, source) {
-                    definitions.insert(W(range), value);
+            .matches(&self.queries.preprocessor.0, tree.root_node(), source)
+            .map(|m| self.queries.preprocessor.parse(source, m))
+            .for_each(|(n, p)| {
+                match p {
+                    Preprocessor::Include(filename) => {
+                        definitions.insert(W(W(&n).into()), Decl::Include(Self::find_file(filename)));
+                    },
+                    Preprocessor::Import(variable) => {
+                        definitions.insert(W(W(&n).into()), Decl::Import(Self::find_environment_variable(variable)));
+                    }
+                    _ => { },
                 }
             });
-        Ok(())
     }
 
     pub async fn add_file(&self, uri: Url, content: String, version: i32) -> Result<()> {
@@ -246,7 +227,7 @@ impl Cache {
         let names = &self.queries.function_definition.capture_names();
 
         let mut definitions = Definitions::new();
-        let _ = self.preprocess(source, &tree, &mut definitions);
+        self.preprocess(source, &tree, &mut definitions);
 
         QueryCursor::new()
             .matches(&self.queries.function_definition, tree.root_node(), source)
