@@ -1,5 +1,3 @@
-#[allow(unused_imports)]
-
 pub mod cache;
 pub mod parser_pool;
 pub mod queries;
@@ -134,9 +132,6 @@ async fn load_builtins(cache: &Cache, parsers: &ParserPool) -> std::result::Resu
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn Error>> {
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-
     let args : Vec<String> = std::env::args().collect();
 
     let filename = args
@@ -163,6 +158,9 @@ async fn main() -> std::result::Result<(), Box<dyn Error>> {
         cache,
         parsers,
     });
+
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
     Server::new(stdin, stdout, socket).serve(service).await;
     Ok(())
 }
@@ -171,21 +169,36 @@ async fn main() -> std::result::Result<(), Box<dyn Error>> {
 mod tests {
     use std::error::Error;
     
+    use tower_lsp::{LspService, LanguageServer};
+    use tower_lsp::lsp_types::*;
     use url::Url;
 
-    use super::{new_pool, ParserPool, Cache, load_builtins, cache, cache::Value};
+    use crate::Backend;
+    use crate::cache::markdown;
 
-    async fn make() -> Result<(ParserPool, Cache), Box<dyn Error>> {
+    use super::{new_pool, Cache, load_builtins, cache, cache::Value};
+
+    async fn make(include_builtins: bool) -> Result<LspService<Backend>, Box<dyn Error>> {
         let language = tree_sitter_fastbuild::language();
-        let parsers = new_pool(language.clone())?;
         let cache = Cache::new(&language)?;
-        load_builtins(&cache, &parsers).await?;
-        Ok((parsers, cache))
+        let parsers = new_pool(language)?;
+        if include_builtins {
+            load_builtins(&cache, &parsers).await?;
+        }
+        let (service, _) = LspService::new(|client| Backend {
+            client,
+            cache,
+            parsers,
+        });
+        Ok(service)
     }
 
     #[tokio::test]
     async fn builtins() -> Result<(), Box<dyn Error>> {
-        let (_, cache) = make().await?;
+        let language = tree_sitter_fastbuild::language();
+        let cache = Cache::new(&language)?;
+        let parsers = new_pool(language)?;
+        load_builtins(&cache, &parsers).await?;
         let mut path = tokio::fs::canonicalize(file!()).await?;
         assert!(path.pop());
         assert!(path.pop());
@@ -199,4 +212,78 @@ mod tests {
         assert_eq!(alias.value, Ok(Value::Function));
         Ok(())
     }
+
+    #[tokio::test]
+    async fn goto_declaration() -> Result<(), Box<dyn Error>> {
+        let service = make(false).await?;
+        let service = service.inner();
+        assert!(service.initialize(InitializeParams::default()).await.is_ok());
+        service.initialized(InitializedParams { }).await;
+        let uri = Url::parse("memory://goto_definition.bff")?;
+        let text = "function Alias() {}\nAlias() {}";
+        let language_id = "fastbuild".to_string();
+        let document = TextDocumentIdentifier { uri: uri.clone() };
+        let text_document = TextDocumentItem {
+            uri: uri.clone(),
+            language_id,
+            text: text.to_string(),
+            version: 0,
+        };
+        service.did_open(DidOpenTextDocumentParams { text_document }).await;
+        let response = service.goto_declaration(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: document,
+                position: Position { line: 1, character: 0 }
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }).await?;
+        service.shutdown().await?;
+        let range = Range::new(
+            Position::new(0, 0),
+            Position::new(0, text.lines().next().ok_or(cache::Error::SymbolNotFound)?.len() as u32)
+        );
+        assert_eq!(response, Some(GotoDefinitionResponse::Scalar(
+            Location { uri, range }
+        )));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hover() -> Result<(), Box<dyn Error>> {
+        let service = make(false).await?;
+        let service = service.inner();
+        assert!(service.initialize(InitializeParams::default()).await.is_ok());
+        service.initialized(InitializedParams { }).await;
+        let uri = Url::parse("memory://hover.bff")?;
+        let text = "// docs\nfunction Alias() {}\nAlias() {}";
+        let language_id = "fastbuild".to_string();
+        let document = TextDocumentIdentifier { uri: uri.clone() };
+        let text_document = TextDocumentItem {
+            uri: uri.clone(),
+            language_id,
+            text: text.to_string(),
+            version: 0,
+        };
+        service.did_open(DidOpenTextDocumentParams { text_document }).await;
+        let response = service.hover(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: document,
+                position: Position { line: 2, character: 0 }
+            },
+            work_done_progress_params: Default::default(),
+        }).await?;
+        service.shutdown().await?;
+        let range = Range::new(
+            Position::new(0, 0),
+            Position::new(0, text.lines().nth(1).ok_or(cache::Error::SymbolNotFound)?.len() as u32)
+        );
+        assert_eq!(response, Some(Hover {
+            contents: HoverContents::Markup(markdown("docs\n")),
+            range: None,
+        }));
+        Ok(())
+        
+    }
+
 }
