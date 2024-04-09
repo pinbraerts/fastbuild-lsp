@@ -19,6 +19,7 @@ use tower_lsp::jsonrpc::Result;
 
 use tracing::{info, Level, warn};
 
+use crate::cache::Symbol;
 use crate::parser_pool::new_pool;
 
 struct Backend {
@@ -55,23 +56,32 @@ impl LanguageServer for Backend {
     async fn goto_definition(&self, parameters: GotoDefinitionParams) -> Result<Option<GotoDefinitionResponse>> {
         info!("go to definition request {:?}", parameters);
         let document = parameters.text_document_position_params;
-        Ok(self.cache.find_definition(document.text_document.uri, document.position)
+        Ok(self.cache.find_symbol(document.text_document.uri, document.position)
+            .map(|(u, _, s)| Location::new(u, s.range))
             .map(GotoDefinitionResponse::Scalar))
     }
 
     async fn goto_declaration(&self, parameters: GotoDefinitionParams) -> Result<Option<GotoDefinitionResponse>> {
         info!("go to definition request {:?}", parameters);
         let document = parameters.text_document_position_params;
-        Ok(self.cache.find_definition(document.text_document.uri, document.position)
+        Ok(self.cache.find_symbol(document.text_document.uri, document.position)
+            .map(|(u, _, s)| Location::new(u, s.range))
             .map(GotoDefinitionResponse::Scalar))
     }
 
     async fn hover(&self, parameters: HoverParams) -> Result<Option<Hover>> {
         info!("hover request {:?}", parameters);
         let document = parameters.text_document_position_params;
-        Ok(self.cache.find_hover(document.text_document.uri, document.position)
-            .map(HoverContents::Markup)
-            .map(|contents| Hover { contents, range: None }))
+        let result = self.cache.find_symbol(document.text_document.uri, document.position);
+        if let Some((_, range, Symbol { documentation: Some(docs), .. })) = result {
+            Ok(Some(Hover {
+                contents: HoverContents::Markup(docs),
+                range: Some(range),
+            }))
+        }
+        else {
+            Ok(None)
+        }
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -272,18 +282,13 @@ mod tests {
                 position: Position { line: 2, character: 0 }
             },
             work_done_progress_params: Default::default(),
-        }).await?;
+        }).await?.ok_or(cache::Error::SymbolNotFound)?;
         service.shutdown().await?;
-        let range = Range::new(
-            Position::new(0, 0),
-            Position::new(0, text.lines().nth(1).ok_or(cache::Error::SymbolNotFound)?.len() as u32)
-        );
-        assert_eq!(response, Some(Hover {
-            contents: HoverContents::Markup(markdown("docs\n")),
-            range: None,
-        }));
+        assert_eq!(response.contents, HoverContents::Markup(markdown("docs\n")));
+        let range = response.range.expect("should have range");
+        assert_eq!(range.start, Position::new(2, 0));
+        assert_eq!(range.end, Position::new(2, 5));
         Ok(())
-        
     }
 
 }

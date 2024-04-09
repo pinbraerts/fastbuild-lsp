@@ -1,13 +1,13 @@
 use std::{collections::HashMap, env::VarError};
 use dashmap::{DashMap, mapref::entry::Entry};
-use tower_lsp::lsp_types::{Location, MarkupContent, Position, MarkupKind, Range};
+use tower_lsp::lsp_types::{MarkupContent, Position, MarkupKind, Range};
 use url::Url;
 use tracing::trace;
 use tree_sitter::{QueryCursor, QueryError, Node, Language, Parser};
 
 use crate::{queries::{Queries, Preprocessor}, helpers::W};
 
-#[derive(thiserror::Error, Debug, Eq, PartialEq)]
+#[derive(thiserror::Error, Debug, Eq, PartialEq, Clone)]
 pub enum Error {
     #[error("symbol not found")]
     SymbolNotFound,
@@ -40,7 +40,7 @@ pub enum Value {
     Macro,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub struct Symbol {
     pub range: Range,
     pub documentation: Option<MarkupContent>,
@@ -185,26 +185,20 @@ impl Cache {
         Ok(())
     }
 
-    pub fn find_definition(&self, uri: Url, position: Position) -> Option<Location> {
-        let word = self.get_word(uri, position)?;
+    pub fn find_symbol(&self, uri: Url, position: Position) -> Option<(Url, Range, Symbol)> {
+        let (word, range) = self.get_word(uri, position)?;
         self.files.iter()
-            .find_map(|f| f.symbols.get(word.as_str()).map(|symbol| Location {
-                uri: f.key().clone(),
-                range: symbol.range,
-            }))
+            .find_map(|f| f.symbols
+                .get(word.as_str())
+                .map(|s| (f.key().clone(), range, (*s).clone()))
+            )
     }
 
-    pub fn find_hover(&self, uri: Url, position: Position) -> Option<MarkupContent> {
-        let word = self.get_word(uri, position)?;
-        self.files.iter()
-            .find_map(|f| f.symbols.get(word.as_str())?.documentation.clone())
-    }
-
-    fn get_word(&self, uri: Url, position: Position) -> Option<String> {
+    fn get_word(&self, uri: Url, position: Position) -> Option<(String, Range)> {
         let file = self.files.get(&uri)?;
         let point = W(&position).into();
         let closest = file.tree.root_node().descendant_for_point_range(point, point)?;
-        match closest.kind() {
+        let closest = match closest.kind() {
             "identifier" => {
                 Some(closest)
             },
@@ -212,7 +206,9 @@ impl Cache {
                 closest.child(0)
             },
             _ => None,
-        }?.utf8_text(file.content.as_bytes()).ok().map(|s| s.to_owned())
+        }?;
+        let word = closest.utf8_text(file.content.as_bytes()).ok()?;
+        Some((word.to_string(), W(&closest).into()))
     }
 
 }
