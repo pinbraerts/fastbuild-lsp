@@ -198,15 +198,6 @@ impl Cache {
         let file = self.files.get(&uri)?;
         let point = W(&position).into();
         let closest = file.tree.root_node().descendant_for_point_range(point, point)?;
-        let closest = match closest.kind() {
-            "identifier" => {
-                Some(closest)
-            },
-            "usage" => {
-                closest.child(0)
-            },
-            _ => None,
-        }?;
         let word = closest.utf8_text(file.content.as_bytes()).ok()?;
         Some((word.to_string(), W(&closest).into()))
     }
