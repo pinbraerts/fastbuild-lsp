@@ -1,5 +1,5 @@
 use tower_lsp::lsp_types::{Range, Position};
-use tree_sitter::{QueryCapture, Point, Node};
+use tree_sitter::{Point, Node};
 use std::ops::Deref;
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Default)]

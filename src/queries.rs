@@ -1,7 +1,4 @@
-use std::ops::Deref;
-
-use tower_lsp::lsp_types::Documentation;
-use tree_sitter::{Query, Language, QueryError, QueryCapture, QueryMatch, QueryCursor, Node};
+use tree_sitter::{Query, Language, QueryError, QueryMatch, Node};
 
 pub enum Preprocessor<'tree> {
     Define (&'tree str),
@@ -80,7 +77,6 @@ impl FunctionQuery {
     }
 
     pub fn parse<'tree>(&self, source: &'tree [u8], _match: QueryMatch<'_, 'tree>) -> (Node<'tree>, Function<'tree>) {
-        let capture = _match.captures.first().expect("queries should have captures");
         let names = self.0.capture_names();
         let mut documentation: Vec<&'tree str> = Vec::new();
         let mut function: Option<Node<'tree>> = None;

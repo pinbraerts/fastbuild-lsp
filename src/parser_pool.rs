@@ -1,8 +1,5 @@
 use deadpool::managed::{self, BuildError};
-use tree_sitter::{Language, Parser};
-
-#[derive(Debug)]
-pub enum Error { Fail }
+use tree_sitter::{Language, Parser, LanguageError};
 
 pub struct ParserManager {
     language: Language,
@@ -11,15 +8,15 @@ pub struct ParserManager {
 #[async_trait::async_trait]
 impl managed::Manager for ParserManager {
     type Type = Parser;
-    type Error = Error;
+    type Error = LanguageError;
 
-    async fn create(&self) -> Result<Parser, Error> {
+    async fn create(&self) -> Result<Parser, Self::Error> {
         let mut parser = Parser::new();
-        parser.set_language(&self.language).map_err(|_| Error::Fail)?;
+        parser.set_language(&self.language)?;
         Ok(parser)
     }
 
-    async fn recycle(&self, _: &mut Parser, _: &managed::Metrics) -> managed::RecycleResult<Error> {
+    async fn recycle(&self, _: &mut Parser, _: &managed::Metrics) -> managed::RecycleResult<Self::Error> {
         Ok(())
     }
 
