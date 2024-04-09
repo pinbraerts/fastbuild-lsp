@@ -1,21 +1,26 @@
+#[allow(unused_imports)]
+
 pub mod cache;
 pub mod parser_pool;
 pub mod queries;
 pub mod helpers;
 
-use std::ops::{Deref, DerefMut};
-use std::{fs::File, path::Path, collections::HashMap, io};
+use std::error::Error;
+use futures::future;
+use tokio::fs;
+use std::ops::DerefMut;
+use std::path::PathBuf;
+use std::fs::File;
 
 use cache::Cache;
-use parser_pool::{ParserPool, ParserManager};
-use tower_lsp::lsp_types::{InitializeResult, InitializedParams, MessageType};
-use tower_lsp::{Client, LanguageServer, Server, LspService};
+use parser_pool::ParserPool;
+use tokio::io::AsyncReadExt;
 use tower_lsp::lsp_types::*;
-use tower_lsp::jsonrpc::{Error, Result};
+use tower_lsp::{Client, LanguageServer, Server, LspService};
+use tower_lsp::jsonrpc::Result;
 
-use tracing::{info, debug, Level, error, trace, warn};
+use tracing::{info, Level, warn};
 
-use crate::cache::FileCache;
 use crate::parser_pool::new_pool;
 
 struct Backend {
@@ -100,8 +105,35 @@ impl LanguageServer for Backend {
 
 }
 
+async fn process_file(cache: &Cache, parsers: &ParserPool, mut path: PathBuf, filename: &str) -> std::result::Result<(), Box<dyn Error>> {
+    path.push(filename);
+    let uri = Url::from_file_path(&path).map_err(|_| cache::Error::FileNotFound)?;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut content = String::new();
+    file.read_to_string(&mut content).await?;
+    let mut parser = parsers.get().await?;
+    cache.add_file(parser.as_mut(), uri, content, 0)?;
+    Ok(())
+}
+
+async fn load_builtins(cache: &Cache, parsers: &ParserPool) -> std::result::Result<(), Box<dyn Error>> {
+    info!("loading builtin declarations");
+    let mut path = fs::canonicalize(file!()).await?;
+    path.pop();
+    path.pop();
+    path.push("builtins");
+    let files = [
+        "alias.bff",
+    ];
+    let future = future::try_join_all(files.iter().map(|filename| {
+        process_file(cache, parsers, path.clone(), filename)
+    }));
+    future.await?;
+    Ok(())
+}
+
 #[tokio::main]
-async fn main() {
+async fn main() -> std::result::Result<(), Box<dyn Error>> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
@@ -119,17 +151,11 @@ async fn main() {
             .init();
     }
 
-    info!("loading builtin declarations");
-    let path = Path::new("/home/pinbraerts/src/fastbuild-lsp/builtins/alias.bff");
-    let (url, content) = Cache::load_file(path).unwrap();
-
     let language = tree_sitter_fastbuild::language();
-    let parsers = new_pool(language.clone()).expect("failed to create language");
-    let mut parser = parsers.get().await.expect("parser is unavailable");
+    let parsers = new_pool(language.clone())?;
+    let cache = Cache::new(&language)?;
 
-    info!("creating cache");
-    let cache = Cache::new(&language).unwrap();
-    cache.add_file(parser.as_mut(), url, content, 0).unwrap();
+    load_builtins(&cache, &parsers).await?;
 
     info!("starting LSP server");
     let (service, socket) = LspService::new(|client| Backend {
@@ -138,4 +164,39 @@ async fn main() {
         parsers,
     });
     Server::new(stdin, stdout, socket).serve(service).await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+    
+    use url::Url;
+
+    use super::{new_pool, ParserPool, Cache, load_builtins, cache, cache::Value};
+
+    async fn make() -> Result<(ParserPool, Cache), Box<dyn Error>> {
+        let language = tree_sitter_fastbuild::language();
+        let parsers = new_pool(language.clone())?;
+        let cache = Cache::new(&language)?;
+        load_builtins(&cache, &parsers).await?;
+        Ok((parsers, cache))
+    }
+
+    #[tokio::test]
+    async fn builtins() -> Result<(), Box<dyn Error>> {
+        let (_, cache) = make().await?;
+        let mut path = tokio::fs::canonicalize(file!()).await?;
+        assert!(path.pop());
+        assert!(path.pop());
+        path.push("builtins");
+        path.push("alias.bff");
+        let uri = Url::from_file_path(path).map_err(|_| cache::Error::FileNotFound)?;
+        let file_info = cache.files.get(&uri).ok_or(cache::Error::FileNotFound)?;
+        assert!(file_info.once);
+        let alias = file_info.symbols.get("Alias").ok_or(cache::Error::SymbolNotFound)?;
+        assert!(alias.documentation.is_some());
+        assert_eq!(alias.value, Ok(Value::Function));
+        Ok(())
+    }
 }
