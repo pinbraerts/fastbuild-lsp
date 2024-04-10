@@ -132,6 +132,9 @@ impl Cache {
             }
             "preprocessor_once" => {
                 *once = true;
+                if !documentation.is_empty() {
+                    *documentation = String::new();
+                }
                 None
             },
             "function_definition" => {
@@ -141,6 +144,7 @@ impl Cache {
                     Symbol::new(node, Ok(Value::Function), documentation)
                 ))
             }
+            "#" => None,
             &_ => {
                 if !documentation.is_empty() {
                     *documentation = String::new();
@@ -251,7 +255,7 @@ mod tests {
     fn include() {
         let uri = Url::parse("memory://include.bff").expect("surely this is valid");
         let reference = "builtins/alias.bff";
-        let content = format!("#include \"{}\"", reference);
+        let content = format!("// docs\n#include \"{}\"", reference);
         let cache = make_file(uri.clone(), content.clone()).expect("should have include");
         let file_info = cache.files.get(&uri).expect("file not found");
         assert!(!file_info.once);
@@ -259,9 +263,9 @@ mod tests {
         let mut path = std::env::current_dir().expect("should have current dir");
         path.push(reference);
         let include_uri = Url::from_file_path(path).expect("should parse URL");
-        assert_eq!(definition.range.start, Position::new(0, 1));
-        assert_eq!(definition.range.end, Position::new(0, content.len() as u32));
-        assert!(definition.documentation.is_none());
+        assert_eq!(definition.range.start, Position::new(1, 1));
+        assert_eq!(definition.range.end, Position::new(1, content.lines().last().unwrap().len() as u32));
+        assert_eq!(definition.documentation, Some(markdown("docs\n")));
         assert_eq!(definition.value, Ok(Value::Filename(include_uri)));
     }
 
@@ -269,7 +273,7 @@ mod tests {
     fn include_braces() {
         let uri = Url::parse("memory://include.bff").expect("surely this is valid");
         let reference = "builtins/alias.bff";
-        let content = format!("#include <{}>", reference);
+        let content = format!("// docs\n#include <{}>", reference);
         let cache = make_file(uri.clone(), content.clone()).expect("should have include");
         let file_info = cache.files.get(&uri).expect("file not found");
         assert!(!file_info.once);
@@ -277,9 +281,9 @@ mod tests {
         let mut path = std::env::current_dir().expect("should have current dir");
         path.push(reference);
         let include_uri = Url::from_file_path(path).expect("should parse URL");
-        assert_eq!(definition.range.start, Position::new(0, 1));
-        assert_eq!(definition.range.end, Position::new(0, content.len() as u32));
-        assert!(definition.documentation.is_none());
+        assert_eq!(definition.range.start, Position::new(1, 1));
+        assert_eq!(definition.range.end, Position::new(1, content.lines().last().unwrap().len() as u32));
+        assert_eq!(definition.documentation, Some(markdown("docs\n")));
         assert_eq!(definition.value, Ok(Value::Filename(include_uri)));
     }
 
@@ -287,14 +291,14 @@ mod tests {
     fn include_does_not_exist() {
         let uri = Url::parse("memory://include.bff").expect("surely this is valid");
         let reference = "not-existent";
-        let content = format!("#include \"{}\"", reference);
+        let content = format!("// docs\n#include \"{}\"", reference);
         let cache = make_file(uri.clone(), content.clone()).expect("should have include");
         let file_info = cache.files.get(&uri).expect("file not found");
         assert!(!file_info.once);
         let definition = file_info.symbols.get(reference).expect("should have definition");
-        assert_eq!(definition.range.start, Position::new(0, 1));
-        assert_eq!(definition.range.end, Position::new(0, content.len() as u32));
-        assert!(definition.documentation.is_none());
+        assert_eq!(definition.range.start, Position::new(1, 1));
+        assert_eq!(definition.range.end, Position::new(1, content.lines().last().unwrap().len() as u32));
+        assert_eq!(definition.documentation, Some(markdown("docs\n")));
         assert_eq!(definition.value, Err(Error::FileNotFound));
     }
 
@@ -302,15 +306,15 @@ mod tests {
     fn import() {
         let uri = Url::parse("memory://import.bff").expect("surely this is valid");
         let reference = "HOME";
-        let content = format!("#import {}", reference);
+        let content = format!("// docs\n#import {}", reference);
         let cache = make_file(uri.clone(), content.to_string()).expect("should have include");
         let file_info = cache.files.get(&uri).expect("file not found");
         assert!(!file_info.once);
         let definition = file_info.symbols.get(reference).expect("should have definition");
         let home = std::env::var(reference).expect("HOME should exist");
-        assert_eq!(definition.range.start, Position::new(0, 1));
-        assert_eq!(definition.range.end, Position::new(0, content.len() as u32));
-        assert!(definition.documentation.is_none());
+        assert_eq!(definition.range.start, Position::new(1, 1));
+        assert_eq!(definition.range.end, Position::new(1, content.lines().last().unwrap().len() as u32));
+        assert_eq!(definition.documentation, Some(markdown("docs\n")));
         assert_eq!(definition.value, Ok(Value::String(home)));        
     }
 
@@ -327,14 +331,14 @@ mod tests {
     fn import_not_present() {
         let uri = Url::parse("memory://import.bff").expect("surely this is valid");
         let reference = "not_present";
-        let content = format!("#import {}", reference);
+        let content = format!("// import\n#import {}", reference);
         let cache = make_file(uri.clone(), content.clone()).expect("should have include");
         let file_info = cache.files.get(&uri).expect("file not found");
         assert!(!file_info.once);
         let definition = file_info.symbols.get(reference).expect("should have definition");
-        assert_eq!(definition.range.start, Position::new(0, 1));
-        assert_eq!(definition.range.end, Position::new(0, content.len() as u32));
-        assert!(definition.documentation.is_none());
+        assert_eq!(definition.range.start, Position::new(1, 1));
+        assert_eq!(definition.range.end, Position::new(1, content.lines().last().unwrap().len() as u32));
+        assert_eq!(definition.documentation, Some(markdown("import\n")));
         assert_eq!(definition.value, Err(Error::EnvironmentVariableNotFound));        
     }
 
@@ -344,14 +348,14 @@ mod tests {
         let non_unicode = OsString::from_vec(vec![255]);
         std::env::set_var(reference, non_unicode);
         let uri = Url::parse("memory://import.bff").expect("surely this is valid");
-        let content = format!("#import {}", reference);
+        let content = format!("// import\n#import {}", reference);
         let cache = make_file(uri.clone(), content.clone()).expect("should have include");
         let file_info = cache.files.get(&uri).expect("file not found");
         assert!(!file_info.once);
         let definition = file_info.symbols.get(reference).expect("should have definition");
-        assert_eq!(definition.range.start, Position::new(0, 1));
-        assert_eq!(definition.range.end, Position::new(0, content.len() as u32));
-        assert!(definition.documentation.is_none());
+        assert_eq!(definition.range.start, Position::new(1, 1));
+        assert_eq!(definition.range.end, Position::new(1, content.lines().last().unwrap().len() as u32));
+        assert_eq!(definition.documentation, Some(markdown("import\n")));
         assert!(definition.value.is_err());        
     }
 
