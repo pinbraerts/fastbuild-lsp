@@ -157,8 +157,8 @@ async fn main() -> std::result::Result<(), Box<dyn Error>> {
     }
 
     let language = tree_sitter_fastbuild::language();
-    let parsers = new_pool(language.clone())?;
-    let cache = Cache::new(&language)?;
+    let parsers = new_pool(language)?;
+    let cache = Cache::new();
 
     load_builtins(&cache, &parsers).await?;
 
@@ -190,7 +190,7 @@ mod tests {
 
     async fn make(include_builtins: bool) -> Result<LspService<Backend>, Box<dyn Error>> {
         let language = tree_sitter_fastbuild::language();
-        let cache = Cache::new(&language)?;
+        let cache = Cache::new();
         let parsers = new_pool(language)?;
         if include_builtins {
             load_builtins(&cache, &parsers).await?;
@@ -206,7 +206,7 @@ mod tests {
     #[tokio::test]
     async fn builtins() -> Result<(), Box<dyn Error>> {
         let language = tree_sitter_fastbuild::language();
-        let cache = Cache::new(&language)?;
+        let cache = Cache::new();
         let parsers = new_pool(language)?;
         load_builtins(&cache, &parsers).await?;
         let mut path = tokio::fs::canonicalize(file!()).await?;

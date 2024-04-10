@@ -1,11 +1,11 @@
-use std::{collections::HashMap, env::VarError};
-use dashmap::{DashMap, mapref::entry::Entry};
+use std::{collections::HashMap, env::VarError, str::Utf8Error, os::unix::ffi::OsStrExt};
+use dashmap::DashMap;
 use tower_lsp::lsp_types::{MarkupContent, Position, MarkupKind, Range};
 use url::Url;
 use tracing::trace;
-use tree_sitter::{QueryCursor, QueryError, Node, Language, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
-use crate::{queries::{Queries, Preprocessor}, helpers::W};
+use crate::helpers::W;
 
 #[derive(thiserror::Error, Debug, Eq, PartialEq, Clone)]
 pub enum Error {
@@ -20,7 +20,7 @@ pub enum Error {
     #[error("environment variable not found")]
     EnvironmentVariableNotFound,
     #[error("not unicode")]
-    NotUnicode,
+    NotUnicode(#[from] Utf8Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -48,11 +48,16 @@ pub struct Symbol {
 }
 
 impl Symbol {
-    fn new(node: &Node, value: Result<Value>) -> Self {
+    fn new(node: &Node, value: Result<Value>, documentation: &mut String) -> Self {
         Self {
             range: W(node).into(),
             value,
-            documentation: None,
+            documentation: if documentation.is_empty() {
+                None
+            }
+            else {
+                Some(markdown(std::mem::take(documentation)))
+            },
         }
     }
 }
@@ -62,30 +67,115 @@ pub type Symbols = HashMap::<Box<str>, Symbol>;
 #[derive(Debug)]
 pub struct FileInformation {
     pub content: String,
-    pub version: i32,
     pub tree: tree_sitter::Tree,
+    pub version: i32,
     pub symbols: Symbols,
     pub once: bool,
 }
 
 pub type FileCache = DashMap<Url, FileInformation>;
 
+#[derive(Default)]
 pub struct Cache {
     pub(crate) files: FileCache,
-    queries: Queries,
 }
 
 impl Cache {
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    pub fn new(language: &Language) -> std::result::Result<Self, QueryError> {
-        let queries = Queries::new(language)?;
-        Ok(Cache {
-            files: FileCache::default(),
-            queries,
+    pub fn map_node<'tree>(&self, documentation: &mut String, node: &'tree Node, source: &'tree [u8], once: &mut bool) -> Result<Option<(&'tree str, Symbol)>> {
+        Ok(match node.kind() {
+            "comment" => {
+                if let Some(trimmed) = node.utf8_text(source)?.get(3..) {
+                    *documentation += trimmed;
+                    *documentation += "\n";
+                }
+                None
+            }
+            "preprocessor_define" => {
+                let name = node.child_by_field_name("variable").ok_or(Error::Parse)?.utf8_text(source)?;
+                Some((
+                    name,
+                    Symbol::new(node, Ok(Value::Macro), documentation)
+                ))
+            }
+            "preprocessor_undef" => {
+                let name = node.child_by_field_name("variable").ok_or(Error::Parse)?.utf8_text(source)?;
+                Some((
+                    name,
+                    Symbol::new(node, Ok(Value::Macro), documentation)
+                ))
+            }
+            "preprocessor_import" => {
+                let name = node.child_by_field_name("variable").ok_or(Error::Parse)?.utf8_text(source)?;
+                Some((
+                    name,
+                    Symbol::new(
+                        node,
+                        self.find_environment_variable(name),
+                        documentation
+                    )
+                ))
+            }
+            "preprocessor_include" => {
+                let name = node.child_by_field_name("filename").ok_or(Error::Parse)?.utf8_text(source)?;
+                Some((
+                    name,
+                    Symbol::new(
+                        node,
+                        self.find_file(name),
+                        documentation
+                    )
+                ))
+            }
+            "preprocessor_once" => {
+                *once = true;
+                None
+            },
+            "function_definition" => {
+                let name = node.child_by_field_name("name").ok_or(Error::Parse)?.utf8_text(source)?;
+                Some((
+                    name,
+                    Symbol::new(node, Ok(Value::Function), documentation)
+                ))
+            }
+            &_ => {
+                if !documentation.is_empty() {
+                    *documentation = String::new();
+                }
+                None
+            }
         })
     }
 
-    fn find_file(filename: &str) -> Result<Value> {
+    pub fn convert_tree(&self, tree: &Tree, source: &[u8]) -> Result<(Symbols, bool)> {
+        let mut cursor = tree.walk();
+        if !cursor.goto_first_child() {
+            return Err(Error::Parse);
+        }
+        let mut documentation = String::new();
+        let mut symbols = Symbols::new();
+        let mut once = false;
+        if let Some((name, symbol)) = self.map_node(&mut documentation, &cursor.node(), source, &mut once)? {
+            symbols.insert(name.into(), symbol);
+        }
+        // Symbol {
+        //     range: W(node).into(),
+        //     documentation: None,
+        //     value
+        // };
+        while cursor.goto_next_sibling() {
+            if let Some((name, symbol)) = self.map_node(&mut documentation, &cursor.node(), source, &mut once)? {
+                symbols.insert(name.into(), symbol);
+            }
+        }
+        Ok((symbols, once))
+    }
+
+
+    fn find_file(&self, filename: &str) -> Result<Value> {
         let mut current = std::env::current_dir().map_err(|_| Error::CurrentDirNotFound)?;
         current.push(filename);
         if !current.exists() {
@@ -97,89 +187,24 @@ impl Cache {
         }
     }
 
-    fn find_environment_variable(name: &str) -> Result<Value> {
+    fn find_environment_variable(&self, name: &str) -> Result<Value> {
         match std::env::var(name) {
             Ok(variable) => Ok(Value::String(variable)),
             Err(VarError::NotPresent) => Err(Error::EnvironmentVariableNotFound),
-            Err(VarError::NotUnicode(_)) => Err(Error::NotUnicode),
+            Err(VarError::NotUnicode(s)) => match std::str::from_utf8(s.as_bytes()) {
+                Ok(s) => Ok(Value::String(s.to_string())),
+                Err(e) => Err(Error::NotUnicode(e)),
+            },
         }
-    }
-
-    fn make_documentation(lines: &[&str]) -> Option<MarkupContent> {
-        if lines.is_empty() {
-            return None
-        }
-        Some(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value: lines.iter()
-                .map(|line| line.get(3..).unwrap_or_default())
-                .fold(String::new(), |s, l| s + l + "\n")
-        })
     }
 
     pub fn add_file(&self, parser: &mut Parser, uri: Url, content: String, version: i32) -> Result<()> {
         trace!("processing file {:?}", uri);
         let entry = self.files.entry(uri);
-        let tree = match &entry {
-            Entry::Occupied(occupied) => {
-                let old_version = occupied.get().version;
-                if old_version > version {
-                    return Ok(());
-                }
-                if old_version < version {
-                    None
-                }
-                else {
-                    Some(&occupied.get().tree)
-                }
-            },
-            Entry::Vacant(_) => None,
-        };
 
-        let tree = parser
-            .parse(&content, tree)
-            .ok_or(Error::Parse)?;
+        let tree = parser.parse(&content, None).ok_or(Error::Parse)?;
 
-        let mut symbols = Symbols::new();
-        let source = content.as_bytes();
-        let mut once = false;
-
-        QueryCursor::new()
-            .matches(&self.queries.preprocessor.0, tree.root_node(), source)
-            .map(|m| self.queries.preprocessor.parse(source, m))
-            .for_each(|(n, p)| {
-                match p {
-                    Preprocessor::Include(filename) => {
-                        symbols.insert(filename.into(), Symbol::new(&n, Self::find_file(filename)));
-                    }
-                    Preprocessor::Import(variable) => {
-                        symbols.insert(variable.into(), Symbol::new(&n, Self::find_environment_variable(variable)));
-                    }
-                    Preprocessor::Once => {
-                        once = true;
-                    }
-                    Preprocessor::Define(variable) => {
-                        symbols.insert(variable.into(), Symbol::new(&n, Ok(Value::Macro)));
-                    }
-                    Preprocessor::Undef(variable) => {
-                        symbols.remove(variable);
-                    }
-                    _ => { }
-                }
-            });
-
-        QueryCursor::new()
-            .matches(&self.queries.function_definition.0, tree.root_node(), source)
-            .map(|m| self.queries.function_definition.parse(source, m))
-            .for_each(|(n, f)| {
-                symbols.insert(f.name.into(), Symbol {
-                    range: W(&n).into(),
-                    value: Ok(Value::Function),
-                    documentation: Self::make_documentation(f.documentation.as_slice()),
-                });
-            })
-        ;
-        
+        let (symbols, once) = self.convert_tree(&tree, content.as_bytes())?;
         entry.insert(FileInformation { content, tree, version, symbols, once });
 
         Ok(())
@@ -217,7 +242,7 @@ mod tests {
         let language = tree_sitter_fastbuild::language();
         let mut parser = Parser::new();
         parser.set_language(&language).ok()?;
-        let cache = Cache::new(&language).ok()?;
+        let cache = Cache::new();
         cache.add_file(&mut parser, uri, content.into(), 0).ok()?;
         Some(cache)
     }
@@ -327,7 +352,7 @@ mod tests {
         assert_eq!(definition.range.start, Position::new(0, 1));
         assert_eq!(definition.range.end, Position::new(0, content.len() as u32));
         assert!(definition.documentation.is_none());
-        assert_eq!(definition.value, Err(Error::NotUnicode));        
+        assert!(definition.value.is_err());        
     }
 
     #[test]
