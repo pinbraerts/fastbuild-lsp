@@ -158,17 +158,17 @@ impl Cache {
         let mut documentation = String::new();
         let mut symbols = Symbols::new();
         let mut once = false;
-        if let Some((name, symbol)) = self.map_node(&mut documentation, &cursor.node(), source, &mut once)? {
-            symbols.insert(name.into(), symbol);
-        }
         // Symbol {
         //     range: W(node).into(),
         //     documentation: None,
         //     value
         // };
-        while cursor.goto_next_sibling() {
+        loop {
             if let Some((name, symbol)) = self.map_node(&mut documentation, &cursor.node(), source, &mut once)? {
                 symbols.insert(name.into(), symbol);
+            }
+            if !cursor.goto_next_sibling() {
+                break;
             }
         }
         Ok((symbols, once))
