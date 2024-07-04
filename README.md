@@ -4,8 +4,8 @@ A language server for [FASTBuild](https://fastbuild.org)
 
 ## Features
 
-- [ ] Syntax checking
-- [ ] Diagnostics
+- [x] Syntax checking
+- [x] Diagnostics
 - [ ] Semantic tokens
 - [ ] Hover
 - [ ] Autocompletion

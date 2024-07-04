@@ -1,42 +1,79 @@
-pub mod cache;
 pub mod parser_pool;
 pub mod queries;
+pub mod error;
 pub mod helpers;
 
-use std::error::Error;
-use futures::future;
-use tokio::fs;
-use std::ops::DerefMut;
-use std::path::PathBuf;
+use dashmap::DashMap;
+use helpers::W;
+use queries::Queries;
+use tree_sitter::{Node, QueryCursor, Tree};
 use std::fs::File;
 
-use cache::Cache;
 use parser_pool::ParserPool;
-use tokio::io::AsyncReadExt;
-use tower_lsp::lsp_types::*;
+use tower_lsp::{jsonrpc, lsp_types::*};
 use tower_lsp::{Client, LanguageServer, Server, LspService};
-use tower_lsp::jsonrpc::Result;
+use error::{Result, Error};
 
 use tracing::{info, Level, warn};
 
-use crate::cache::Symbol;
 use crate::parser_pool::new_pool;
+
+#[derive(Debug)]
+struct FileInfo {
+    content: String,
+    tree: Tree,
+    version: i32,
+}
 
 struct Backend {
     client: Client,
-    cache: Cache,
     parsers: ParserPool,
+    files: DashMap<Url, FileInfo>,
+    queries: Queries,
+}
+
+impl Backend {
+
+    async fn process_file(&self, url: Url, content: String, version: i32) -> Result<()> {
+        let mut parser = self.parsers.get().await?;
+        let tree = parser.parse(content.as_bytes(), None).ok_or(Error::Parse)?;
+
+        self.process_syntax_errors(url.clone(), &content, &tree, version).await;
+
+        let entry = self.files.entry(url);
+        entry.insert(FileInfo { content, tree, version });
+        Ok(())
+    }
+
+    async fn process_syntax_errors(&self, url: Url, content: &String, tree: &Tree, version: i32) {
+        let mut cursor = QueryCursor::new();
+        let matches = cursor.matches(&self.queries.error, tree.root_node(), content.as_bytes());
+        let diagnostics = matches
+            .filter_map(|m| m.captures.first())
+            .map(|c| Diagnostic::new(
+                W(&c.node).into(),
+                Some(DiagnosticSeverity::ERROR),
+                None,
+                None,
+                "Syntax Error".into(),
+                None,
+                None,
+            )).collect()
+        ;
+        self.client.publish_diagnostics(url.clone(), diagnostics, Some(version)).await;
+    }
+
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
 
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, _: InitializeParams) -> jsonrpc::Result<InitializeResult> {
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                declaration_provider: Some(DeclarationCapability::Simple(true)),
-                definition_provider: Some(OneOf::Left(true)),
-                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                // declaration_provider: Some(DeclarationCapability::Simple(true)),
+                // definition_provider: Some(OneOf::Left(true)),
+                // hover_provider: Some(HoverProviderCapability::Simple(true)),
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
                 ..Default::default()
             },
@@ -49,39 +86,8 @@ impl LanguageServer for Backend {
         .await;
     }
 
-    async fn shutdown(&self) -> Result<()> {
+    async fn shutdown(&self) -> jsonrpc::Result<()> {
         Ok(())
-    }
-
-    async fn goto_definition(&self, parameters: GotoDefinitionParams) -> Result<Option<GotoDefinitionResponse>> {
-        info!("go to definition request {:?}", parameters);
-        let document = parameters.text_document_position_params;
-        Ok(self.cache.find_symbol(document.text_document.uri, document.position)
-            .map(|(u, _, s)| Location::new(u, s.range))
-            .map(GotoDefinitionResponse::Scalar))
-    }
-
-    async fn goto_declaration(&self, parameters: GotoDefinitionParams) -> Result<Option<GotoDefinitionResponse>> {
-        info!("go to definition request {:?}", parameters);
-        let document = parameters.text_document_position_params;
-        Ok(self.cache.find_symbol(document.text_document.uri, document.position)
-            .map(|(u, _, s)| Location::new(u, s.range))
-            .map(GotoDefinitionResponse::Scalar))
-    }
-
-    async fn hover(&self, parameters: HoverParams) -> Result<Option<Hover>> {
-        info!("hover request {:?}", parameters);
-        let document = parameters.text_document_position_params;
-        let result = self.cache.find_symbol(document.text_document.uri, document.position);
-        if let Some((_, range, Symbol { documentation: Some(docs), .. })) = result {
-            Ok(Some(Hover {
-                contents: HoverContents::Markup(docs),
-                range: Some(range),
-            }))
-        }
-        else {
-            Ok(None)
-        }
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -90,11 +96,11 @@ impl LanguageServer for Backend {
         if document.language_id != "fastbuild" {
             return;
         }
-        let mut parser = match self.parsers.get().await {
-            Ok(x) => x,
-            Err(_) => { return; },
-        };
-        let _ = self.cache.add_file(parser.deref_mut(), document.uri, document.text, document.version);
+        let _ = self.process_file(
+            document.uri,
+            document.text,
+            document.version
+        ).await;
     }
 
     async fn did_change(&self, mut params: DidChangeTextDocumentParams) {
@@ -104,44 +110,17 @@ impl LanguageServer for Backend {
             warn!("file changes: {:?}", params.content_changes);
             return;
         }
-        let mut parser = match self.parsers.get().await {
-            Ok(x) => x,
-            Err(_) => { return; },
-        };
-        let _ = self.cache.add_file(parser.deref_mut(), document.uri, std::mem::take(&mut params.content_changes[0].text), document.version);
+        let _ = self.process_file(
+            document.uri,
+            std::mem::take(&mut params.content_changes[0].text),
+            document.version
+        ).await;
     }
 
 }
 
-async fn process_file(cache: &Cache, parsers: &ParserPool, mut path: PathBuf, filename: &str) -> std::result::Result<(), Box<dyn Error>> {
-    path.push(filename);
-    let uri = Url::from_file_path(&path).map_err(|_| cache::Error::FileNotFound)?;
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut content = String::new();
-    file.read_to_string(&mut content).await?;
-    let mut parser = parsers.get().await?;
-    cache.add_file(parser.as_mut(), uri, content, 0)?;
-    Ok(())
-}
-
-async fn load_builtins(cache: &Cache, parsers: &ParserPool) -> std::result::Result<(), Box<dyn Error>> {
-    info!("loading builtin declarations");
-    let mut path = fs::canonicalize(file!()).await?;
-    path.pop();
-    path.pop();
-    path.push("builtins");
-    let files = [
-        "alias.bff",
-    ];
-    let future = future::try_join_all(files.iter().map(|filename| {
-        process_file(cache, parsers, path.clone(), filename)
-    }));
-    future.await?;
-    Ok(())
-}
-
 #[tokio::main]
-async fn main() -> std::result::Result<(), Box<dyn Error>> {
+async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let args : Vec<String> = std::env::args().collect();
 
     let filename = args
@@ -157,16 +136,16 @@ async fn main() -> std::result::Result<(), Box<dyn Error>> {
     }
 
     let language = tree_sitter_fastbuild::language();
+    let queries = Queries::new(&language)?;
     let parsers = new_pool(language)?;
-    let cache = Cache::new();
-
-    load_builtins(&cache, &parsers).await?;
+    let files = DashMap::new();
 
     info!("starting LSP server");
     let (service, socket) = LspService::new(|client| Backend {
         client,
-        cache,
         parsers,
+        files,
+        queries,
     });
 
     let stdin = tokio::io::stdin();
@@ -177,118 +156,21 @@ async fn main() -> std::result::Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
-    
-    use tower_lsp::{LspService, LanguageServer};
-    use tower_lsp::lsp_types::*;
-    use url::Url;
 
-    use crate::Backend;
-    use crate::cache::markdown;
+    use super::*;
 
-    use super::{new_pool, Cache, load_builtins, cache, cache::Value};
-
-    async fn make(include_builtins: bool) -> Result<LspService<Backend>, Box<dyn Error>> {
+    async fn make() -> LspService<Backend> {
         let language = tree_sitter_fastbuild::language();
-        let cache = Cache::new();
-        let parsers = new_pool(language)?;
-        if include_builtins {
-            load_builtins(&cache, &parsers).await?;
-        }
+        let queries = Queries::new(&language).expect("failed to load queries");
+        let parsers = new_pool(language).expect("failed to create parser pool");
+        let files = DashMap::new();
         let (service, _) = LspService::new(|client| Backend {
             client,
-            cache,
+            files,
             parsers,
+            queries,
         });
-        Ok(service)
-    }
-
-    #[tokio::test]
-    async fn builtins() -> Result<(), Box<dyn Error>> {
-        let language = tree_sitter_fastbuild::language();
-        let cache = Cache::new();
-        let parsers = new_pool(language)?;
-        load_builtins(&cache, &parsers).await?;
-        let mut path = tokio::fs::canonicalize(file!()).await?;
-        assert!(path.pop());
-        assert!(path.pop());
-        path.push("builtins");
-        path.push("alias.bff");
-        let uri = Url::from_file_path(path).map_err(|_| cache::Error::FileNotFound)?;
-        let file_info = cache.files.get(&uri).ok_or(cache::Error::FileNotFound)?;
-        assert!(file_info.once);
-        let alias = file_info.symbols.get("Alias").ok_or(cache::Error::SymbolNotFound)?;
-        assert!(alias.documentation.is_some());
-        assert_eq!(alias.value, Ok(Value::Function));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn goto_declaration() -> Result<(), Box<dyn Error>> {
-        let service = make(false).await?;
-        let service = service.inner();
-        assert!(service.initialize(InitializeParams::default()).await.is_ok());
-        service.initialized(InitializedParams { }).await;
-        let uri = Url::parse("memory://goto_definition.bff")?;
-        let text = "function Alias() {}\nAlias() {}";
-        let language_id = "fastbuild".to_string();
-        let document = TextDocumentIdentifier { uri: uri.clone() };
-        let text_document = TextDocumentItem {
-            uri: uri.clone(),
-            language_id,
-            text: text.to_string(),
-            version: 0,
-        };
-        service.did_open(DidOpenTextDocumentParams { text_document }).await;
-        let response = service.goto_declaration(GotoDefinitionParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: document,
-                position: Position { line: 1, character: 0 }
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        }).await?;
-        service.shutdown().await?;
-        let range = Range::new(
-            Position::new(0, 0),
-            Position::new(0, text.lines().next().ok_or(cache::Error::SymbolNotFound)?.len() as u32)
-        );
-        assert_eq!(response, Some(GotoDefinitionResponse::Scalar(
-            Location { uri, range }
-        )));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn hover() -> Result<(), Box<dyn Error>> {
-        let service = make(false).await?;
-        let service = service.inner();
-        assert!(service.initialize(InitializeParams::default()).await.is_ok());
-        service.initialized(InitializedParams { }).await;
-        let uri = Url::parse("memory://hover.bff")?;
-        let text = "// docs\nfunction Alias() {}\nAlias() {}";
-        let language_id = "fastbuild".to_string();
-        let document = TextDocumentIdentifier { uri: uri.clone() };
-        let text_document = TextDocumentItem {
-            uri: uri.clone(),
-            language_id,
-            text: text.to_string(),
-            version: 0,
-        };
-        service.did_open(DidOpenTextDocumentParams { text_document }).await;
-        let response = service.hover(HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: document,
-                position: Position { line: 2, character: 0 }
-            },
-            work_done_progress_params: Default::default(),
-        }).await?.ok_or(cache::Error::SymbolNotFound)?;
-        service.shutdown().await?;
-        assert_eq!(response.contents, HoverContents::Markup(markdown("docs\n")));
-        let range = response.range.expect("should have range");
-        assert_eq!(range.start, Position::new(2, 0));
-        assert_eq!(range.end, Position::new(2, 5));
-        Ok(())
+        service
     }
 
 }
