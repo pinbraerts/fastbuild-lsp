@@ -1,19 +1,19 @@
-(preprocessor_define (variable) @variable) @define
+(preprocessor_define (identifier) @define)
 
-(preprocessor_undef (variable) @variable) @undef
+(preprocessor_undef (identifier) @undef)
 
-(preprocessor_import (environment_variable) @variable) @import
+(preprocessor_import (identifier) @import)
 
-(preprocessor_include (filename) @filename) @include
+(preprocessor_include (filename) @include)
 
 (preprocessor_once) @once
 
 (
 	(preprocessor_if condition: (preprocessor_expression) @condition)
-	.
+    (_)* @body
 	(
 		(preprocessor_else)
-		.
-	)? @else
+		(_)* @alternative
+	)?
 	(preprocessor_endif)
-) @if
+)
