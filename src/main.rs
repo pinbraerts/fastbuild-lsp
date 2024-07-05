@@ -6,8 +6,9 @@ pub mod helpers;
 use dashmap::DashMap;
 use helpers::W;
 use queries::Queries;
-use tree_sitter::{Node, QueryCursor, Tree};
+use tree_sitter::{Node, Parser, QueryCursor, Tree};
 use std::fs::File;
+use std::ops::DerefMut;
 
 use parser_pool::ParserPool;
 use tower_lsp::{jsonrpc, lsp_types::*};
@@ -20,9 +21,17 @@ use crate::parser_pool::new_pool;
 
 #[derive(Debug)]
 struct FileInfo {
+    version: i32,
     content: String,
     tree: Tree,
-    version: i32,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl FileInfo {
+    fn new(version: i32, parser: &mut Parser, content: String) -> Result<Self> {
+        let tree = parser.parse(content.as_bytes(), None).ok_or(Error::Parse)?;
+        Ok(FileInfo { version, content, tree, diagnostics: Vec::default() })
+    }
 }
 
 struct Backend {
@@ -35,20 +44,19 @@ struct Backend {
 impl Backend {
 
     async fn process_file(&self, url: Url, content: String, version: i32) -> Result<()> {
+        let entry = self.files.entry(url.clone());
         let mut parser = self.parsers.get().await?;
-        let tree = parser.parse(content.as_bytes(), None).ok_or(Error::Parse)?;
-
-        self.process_syntax_errors(url.clone(), &content, &tree, version).await;
-
-        let entry = self.files.entry(url);
-        entry.insert(FileInfo { content, tree, version });
+        let mut scope = entry.insert(FileInfo::new(version, parser.deref_mut(), content)?);
+        self.syntax_pass(&mut scope).await;
+        self.client.publish_diagnostics(url.clone(), scope.diagnostics.clone(), Some(version)).await;
         Ok(())
     }
 
-    async fn process_syntax_errors(&self, url: Url, content: &String, tree: &Tree, version: i32) {
+    async fn syntax_pass(&self, scope: &mut FileInfo) {
         let mut cursor = QueryCursor::new();
-        let matches = cursor.matches(&self.queries.error, tree.root_node(), content.as_bytes());
-        let diagnostics = matches
+        let matches = cursor.matches(&self.queries.error, scope.tree.root_node(), scope.content.as_bytes());
+        scope.diagnostics.extend(
+            matches
             .filter_map(|m| m.captures.first())
             .map(|c| Diagnostic::new(
                 W(&c.node).into(),
@@ -58,9 +66,8 @@ impl Backend {
                 "Syntax Error".into(),
                 None,
                 None,
-            )).collect()
-        ;
-        self.client.publish_diagnostics(url.clone(), diagnostics, Some(version)).await;
+            ))
+        );
     }
 
 }
@@ -104,7 +111,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, mut params: DidChangeTextDocumentParams) {
-        info!("text document open {:?}", params);
+        info!("text document change {:?}", params);
         let document = params.text_document;
         if params.content_changes.len() != 1 {
             warn!("file changes: {:?}", params.content_changes);
@@ -170,7 +177,34 @@ mod tests {
             parsers,
             queries,
         });
+        let backend = service.inner();
+        backend.initialize(InitializeParams::default()).await.expect("failed to initialize server");
+        backend.initialized(InitializedParams{}).await;
         service
+    }
+
+    async fn make_with_file(uri: &str, content: &str) -> (Url, LspService<Backend>) {
+        let uri = Url::parse(uri).expect("failed to parse url");
+        let service = make().await;
+        let backend = service.inner();
+        backend.did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "fastbuild".into(),
+                version: 0,
+                text: content.into(),
+            },
+        }).await;
+        (uri, service)
+    }
+
+    #[tokio::test]
+    async fn syntax_error() {
+        let (uri, service) = make_with_file("memory://syntax_error.bff", ".A =").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        let diagnostic = scope.diagnostics.first().expect("no diagnostic");
+        assert_eq!(diagnostic.message, "Syntax Error");
     }
 
 }
