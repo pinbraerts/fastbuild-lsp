@@ -1,6 +1,4 @@
-use std::ops::Deref;
-
-use tree_sitter::{Language, Node, Query, QueryCapture, QueryCaptures, QueryError, QueryMatch};
+use tree_sitter::{Language, Query, QueryError};
 
 pub struct Queries {
     pub error: Query,

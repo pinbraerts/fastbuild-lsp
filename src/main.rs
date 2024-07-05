@@ -5,14 +5,14 @@ pub mod helpers;
 
 use dashmap::DashMap;
 use helpers::W;
-use queries::{Queries};
+use queries::Queries;
 use tree_sitter::{Node, Parser, QueryCursor, Tree};
-use std::borrow::Borrow;
+
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
+
 use std::ops::DerefMut;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use parser_pool::ParserPool;
 use tower_lsp::{jsonrpc, lsp_types::*};
@@ -50,7 +50,7 @@ impl Symbol {
     fn undefine(&mut self, url: Url, node: Node) -> Option<Option<Location>> {
         let location = match self.references.last() {
             Some((location, Reference::Undef)) => Some(Some(location.clone())),
-            Some((location, Reference::Define)) => None,
+            Some((_, Reference::Define)) => None,
             _ => Some(None),
         };
         self.value = false;
