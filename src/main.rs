@@ -370,4 +370,12 @@ mod tests {
         assert_eq!(scope.diagnostics, vec!());
     }
 
+    #[tokio::test]
+    async fn once() {
+        let (uri, service) = make_with_file("memory://once.bff", "#once").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        assert!(scope.once);
+    }
+
 }
