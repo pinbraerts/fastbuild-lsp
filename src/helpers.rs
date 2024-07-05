@@ -1,4 +1,4 @@
-use tower_lsp::lsp_types::{Range, Position};
+use tower_lsp::lsp_types::{Position, Range, SemanticToken};
 use tree_sitter::{Point, Node};
 use std::ops::Deref;
 
@@ -50,4 +50,55 @@ impl Ord for W<Range> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.start.cmp(&other.start)
     }
+}
+
+impl W<&SemanticToken> {
+
+    pub fn delta(&self, prev: &mut SemanticToken) -> SemanticToken {
+        let result = SemanticToken {
+            delta_line: self.delta_line - prev.delta_line,
+            delta_start: if self.delta_line == prev.delta_line {
+                self.delta_start - prev.delta_start
+            }
+            else {
+                self.delta_start
+            },
+            length: self.length,
+            token_type: self.token_type,
+            token_modifiers_bitset: self.token_modifiers_bitset,
+        };
+        prev.delta_start = self.delta_start;
+        prev.delta_line = self.delta_line;
+        result
+    }
+
+}
+
+impl W<tree_sitter::Range> {
+
+    pub fn is_empty(&self) -> bool {
+        self.0.end_byte <= self.0.start_byte
+    }
+
+    pub fn size(&self) -> usize {
+        if self.is_empty() {
+            0
+        }
+        else {
+            self.0.end_byte - self.0.start_byte
+        }
+    }
+
+}
+
+impl<'tree> W<Node<'tree>> {
+
+    pub fn is_empty(&self) -> bool {
+        W(self.0.range()).is_empty()
+    }
+
+    pub fn size(&self) -> usize {
+        W(self.0.range()).size()
+    }
+
 }
