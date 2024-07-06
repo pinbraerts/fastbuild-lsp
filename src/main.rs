@@ -234,6 +234,7 @@ impl FileInfo {
                     },
                 };
             },
+            "preprocessor_unknown" => Err(node.error("unknown directive"))?,
             "preprocessor_endif" => {
                 let last = if_stack.last().ok_or_else(|| node.error("expected #if"))?;
                 if let Some((start, end)) = match last {
