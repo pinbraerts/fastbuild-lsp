@@ -161,11 +161,11 @@ impl FileInfo {
                 ||
                 self.preprocess_expression(node.expect("right")?)?
             },
-            "call" => {
+            "function_call" => {
                 let argument = node.expect("arguments")?;
                 match node.expect("name")?.text(self.content.as_bytes())? {
                     "exists" => self.preprocess_expression(argument)?,
-                    "file_exists" => self.find_file(node)?,
+                    "file_exists" => self.find_file(argument).and(Ok(true))?,
                     _ => {
                         return Err(node.error("unknown macro function"));
                     }
@@ -177,17 +177,25 @@ impl FileInfo {
         })
     }
 
-    fn find_file(&self, node: W<Node>) -> std::result::Result<bool, W<Diagnostic>> {
+    fn find_file(&self, node: W<Node>) -> std::result::Result<Url, W<Diagnostic>> {
         let string = node.text(self.content.as_bytes())?;
         let filename = string.get(1..string.len() - 1).ok_or_else(|| node.error("not a string literal"))?;
         let path = Path::new(filename);
         if path.exists() {
-            return Ok(true);
+            Url::from_file_path(path)
         }
-        self.url.to_file_path().ok()
-            .and_then(|x| x.parent().map(|x| x.to_owned()))
-            .map(|x| x.join(path).exists())
-            .ok_or_else(|| node.error("could not fild file"))
+        else {
+            self.url.to_file_path()
+                .and_then(|x| {
+                    let joined = x.parent().ok_or(())?.join(path);
+                    if joined.exists() {
+                        Url::from_file_path(joined).map_err(|_| ())
+                    }
+                    else {
+                        Err(())
+                    }
+                })
+        }.map_err(|_| node.error("could not fild file"))
     }
 
     fn preprocessor_directive<'tree>(&mut self, node: W<Node<'tree>>, if_stack: &mut IfStack<'tree>) -> std::result::Result<bool, W<Diagnostic>> {
@@ -210,6 +218,10 @@ impl FileInfo {
                 let text = variable.text(self.content.as_bytes())?.to_owned();
                 let entry = self.definitions.entry(text).or_default();
                 entry.undefine(&self.url, variable)?;
+            },
+            "preprocessor_include" => if !skip {
+                let filename = node.expect("filename")?;
+                let _ = self.find_file(filename)?;
             },
             "preprocessor_once" => if !skip { self.once = true; },
             "preprocessor_if" => {
@@ -618,6 +630,22 @@ mod tests {
         assert_eq!(diagnostic.range.start.character, 1);
         assert_eq!(diagnostic.range.end.line, 0);
         assert_eq!(diagnostic.range.end.character, 8);
+    }
+
+    #[tokio::test]
+    async fn preprocessor_include() {
+        let (uri, service) = make_with_file("file:///home/pinbraerts/src/fastbuild-lsp/builtins/preprocessor_include.bff", "#include \"alias.bff\"").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.diagnostics, vec![]);
+    }
+
+    #[tokio::test]
+    async fn preprocessor_if_file_exists() {
+        let (uri, service) = make_with_file("file:///home/pinbraerts/src/fastbuild-lsp/builtins/preprocessor_if_file_exists.bff", "#if file_exists(\"../src/main.rs\")\n#endif").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.diagnostics, vec![]);
     }
 
 }
