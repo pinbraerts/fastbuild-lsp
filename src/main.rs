@@ -129,7 +129,7 @@ impl FileInfo {
             }
         }
         for (_, n_if, n_else) in if_stack {
-            self.diagnostics.push(n_if.error("missing #endif directive").with(
+            self.diagnostics.push(n_if.error("expected #endif").with(
                 n_else.map(|e| e.related(&self.url, "#else here"))
             ).0);
         }
@@ -224,15 +224,13 @@ impl FileInfo {
                             last.2 = Some(node);
                         }
                     },
-                    Some((_, _, Some(n_else))) => {
-                        return Err(node.error("duplicate #else directive").with(
+                    Some((_, _, Some(n_else))) => Err(
+                        node.error("duplicate #else directive").with(
                             Some(n_else.related(&self.url, "previous #else here"))
-                        ));
-                    },
-                    None => {
-                        return Err(node.error("missing #if directive"));
-                    },
-                };
+                        )
+                    )?,
+                    None => Err(node.error("expected #if"))?,
+                }
             },
             "preprocessor_unknown" => Err(node.error("unknown directive"))?,
             "preprocessor_endif" => {
