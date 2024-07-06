@@ -1,5 +1,4 @@
 pub mod parser_pool;
-pub mod queries;
 pub mod error;
 pub mod helpers;
 
@@ -8,10 +7,9 @@ use dashmap::DashMap;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use helpers::W;
-use queries::Queries;
 use tokio::io::AsyncReadExt;
 use tokio::sync::OnceCell;
-use tree_sitter::{Node, Parser, QueryCursor, Tree};
+use tree_sitter::{Node, Parser, Tree};
 
 use tokio::fs::File;
 
@@ -146,7 +144,6 @@ struct Backend {
     client: Client,
     parsers: ParserPool,
     files: DashMap<Url, FileInfo>,
-    queries: Queries,
 }
 
 impl Backend {
@@ -161,7 +158,6 @@ impl Backend {
             let mut parser = self.parsers.get().await?;
             let scope = FileInfo::new(version, content, parser.deref_mut(), definitions)?;
             let mut scope = self.files.entry(url.clone()).insert(scope);
-            self.syntax_pass(&mut scope);
             self.preprocessor_pass(&url, &mut scope).await;
             self.client.publish_diagnostics(
                 url.clone(),
@@ -170,16 +166,6 @@ impl Backend {
             ).await;
             Ok(())
         }.boxed()
-    }
-
-    fn syntax_pass(&self, scope: &mut FileInfo) {
-        let mut cursor = QueryCursor::new();
-        let matches = cursor.matches(&self.queries.error, scope.tree.root_node(), scope.content.as_bytes());
-        scope.diagnostics.extend(
-            matches
-            .filter_map(|m| m.captures.first())
-            .map(|c| W(c.node).error("Syntax Error").0)
-        );
     }
 
     async fn preprocessor_pass(&self, url: &Url, scope: &mut FileInfo) {
@@ -314,6 +300,8 @@ impl Backend {
                 }
             },
             "preprocessor_once" => if !skip { scope.once = true; },
+            "preprocessor_unknown" => if !skip { Err(node.error("unknown directive"))? },
+            "ERROR" => if !skip { Err(node.error("syntax"))? },
             "preprocessor_if" => {
                 let condition = node.expect("condition")?;
                 let result = self.preprocess_expression(url, scope, condition);
@@ -334,7 +322,6 @@ impl Backend {
                     None => Err(node.error("expected #if"))?,
                 }
             },
-            "preprocessor_unknown" => Err(node.error("unknown directive"))?,
             "preprocessor_endif" => {
                 let last = if_stack.last().ok_or_else(|| node.error("expected #if"))?;
                 if let Some((start, end)) = match last {
@@ -364,14 +351,13 @@ impl Backend {
 
     fn new(client: Client) -> Result<Self> {
         let language = tree_sitter_fastbuild::language();
-        let queries = Queries::new(&language)?;
         let mut parser = Parser::new();
         parser.set_language(&language)?;
         let tree = parser.parse("", None).ok_or(Error::Parse)?;
         let _ = NULL.set(tree);
         let parsers = new_pool(language)?;
         let files = DashMap::new();
-        Ok(Backend { client, parsers, files, queries })
+        Ok(Backend { client, parsers, files })
     }
 
 }
@@ -528,7 +514,7 @@ mod tests {
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
-        assert_eq!(diagnostic.message, "Syntax Error");
+        assert_eq!(diagnostic.message, "syntax");
     }
 
     #[tokio::test]
