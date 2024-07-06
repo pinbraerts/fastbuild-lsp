@@ -191,7 +191,7 @@ impl FileInfo {
     }
 
     fn preprocessor_directive<'tree>(&mut self, node: W<Node<'tree>>, if_stack: &mut IfStack<'tree>) -> std::result::Result<bool, W<Diagnostic>> {
-        let skip = if_stack.last().map(|(if_condition, _, n_else)| *if_condition == n_else.is_none()).unwrap_or_default();
+        let skip = if_stack.last().map(|(if_condition, _, n_else)| *if_condition != n_else.is_none()).unwrap_or_default();
         match node.kind() {
             "preprocessor_define" => if !skip {
                 let variable = node.expect("variable")?;
@@ -569,6 +569,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preprocessor_if_evaluation() {
+        let (uri, service) = make_with_file("memory://preprocessor_if_missing.bff", "#define A\n#if 1\n#undef A\n\n#endif\n#if A\n.A = 3\n#endif").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        let token = scope.semantic_tokens.first().expect("no semantic tokens");
+        assert_eq!(token.delta_line, 6, "mismatching lines");
+        assert_eq!(token.delta_start, 0, "mismatching columns");
+        assert_eq!(token.length, u32::max_value(), "mismatching length");
+        assert_eq!(token.token_modifiers_bitset, 0, "mismatching modifiers");
+        assert_eq!(token.token_type, 0, "mismatching types");
+    }
+
     #[tokio::test]
     async fn preprocessor_if_missing() {
         let (uri, service) = make_with_file("memory://preprocessor_if_missing.bff", "#else").await;
