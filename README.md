@@ -6,7 +6,7 @@ A language server for [FASTBuild](https://fastbuild.org)
 
 - [x] Syntax checking
 - [x] Diagnostics
-- [ ] Semantic tokens
+- [x] Semantic tokens (only for faulty `#if` branches)
 - [ ] Hover
 - [ ] Autocompletion
 - [ ] Go to definition
