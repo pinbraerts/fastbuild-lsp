@@ -136,6 +136,18 @@ impl<'tree> W<Node<'tree>> {
         ).into()
     }
 
+    pub fn warning(self, message: impl Into<String>) -> W<Diagnostic> {
+        Diagnostic::new(
+            self.into(),
+            Some(DiagnosticSeverity::WARNING),
+            None,
+            None,
+            message.into(),
+            None,
+            None,
+        ).into()
+    }
+
     pub fn related(self, url: &Url, message: impl Into<String>) -> Vec<DiagnosticRelatedInformation> {
         vec![DiagnosticRelatedInformation {
             message: message.into(),
