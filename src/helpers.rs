@@ -1,9 +1,16 @@
-use tower_lsp::lsp_types::{Position, Range, SemanticToken};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location, Position, Range, SemanticToken};
 use tree_sitter::{Point, Node};
+use url::Url;
 use std::ops::Deref;
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Default)]
 pub struct W<T>(pub T);
+
+impl<T> From<T> for W<T> {
+    fn from(value: T) -> Self {
+        Self(value)
+    }
+}
 
 impl<T> Deref for W<T> {
     type Target = T;
@@ -13,8 +20,8 @@ impl<T> Deref for W<T> {
     }
 }
 
-impl From<W<&Point>> for Position {
-    fn from(value: W<&Point>) -> Self {
+impl From<W<Point>> for Position {
+    fn from(value: W<Point>) -> Self {
         Self {
             line: value.row as u32,
             character: value.column as u32,
@@ -22,8 +29,8 @@ impl From<W<&Point>> for Position {
     }
 }
 
-impl From<W<&Position>> for Point {
-    fn from(value: W<&Position>) -> Self {
+impl From<W<Position>> for Point {
+    fn from(value: W<Position>) -> Self {
         Self {
             row: value.line as usize,
             column: value.character as usize,
@@ -31,11 +38,11 @@ impl From<W<&Position>> for Point {
     }
 }
 
-impl<'tree> From<W<&Node<'tree>>> for Range {
-    fn from(value: W<&Node>) -> Self {
+impl<'tree> From<W<Node<'tree>>> for Range {
+    fn from(value: W<Node>) -> Self {
         Self {
-            start: W(&value.start_position()).into(),
-            end:   W(&value.end_position()).into(),
+            start: W(value.start_position()).into(),
+            end:   W(value.end_position()).into(),
         }
     }
 }
@@ -52,7 +59,7 @@ impl Ord for W<Range> {
     }
 }
 
-impl W<&SemanticToken> {
+impl W<SemanticToken> {
 
     pub fn delta(&self, prev: &mut SemanticToken) -> SemanticToken {
         let result = SemanticToken {
@@ -99,6 +106,43 @@ impl<'tree> W<Node<'tree>> {
 
     pub fn size(&self) -> usize {
         W(self.0.range()).size()
+    }
+
+    pub fn expect(self, name: &str) -> std::result::Result<Self, Diagnostic> {
+        self.child_by_field_name(name)
+            .map(Self)
+            .ok_or_else(|| self.error(format!("expected {}", name)))
+    }
+
+    pub fn text(self, content: &[u8]) -> std::result::Result<&str, Diagnostic> {
+        self.utf8_text(content).map_err(|_| self.error("non-unicode text"))
+    }
+
+    pub fn error(self, message: impl Into<String>) -> Diagnostic {
+        self.error_with(message, None)
+    }
+
+    pub fn error_with(self, message: impl Into<String>, related: Option<Vec<DiagnosticRelatedInformation>>) -> Diagnostic {
+        Diagnostic::new(
+            self.into(),
+            Some(DiagnosticSeverity::ERROR),
+            None,
+            None,
+            message.into(),
+            related,
+            None,
+        )
+    }
+
+    pub fn related(self, url: &Url, message: impl Into<String>) -> Vec<DiagnosticRelatedInformation> {
+        vec![DiagnosticRelatedInformation {
+            message: message.into(),
+            location: self.url(url),
+        }]
+    }
+
+    pub fn url(self, url: &Url) -> Location {
+        Location::new(url.clone(), self.into())
     }
 
 }

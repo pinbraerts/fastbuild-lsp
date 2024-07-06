@@ -6,6 +6,7 @@ pub mod helpers;
 use dashmap::DashMap;
 use helpers::W;
 use queries::Queries;
+use tokio::sync::OnceCell;
 use tree_sitter::{Node, Parser, QueryCursor, Tree};
 
 use std::collections::HashMap;
@@ -37,31 +38,48 @@ struct Symbol {
 
 impl Symbol {
 
-    fn define(&mut self, url: Url, node: Node) -> Option<Location> {
-        let location = match self.references.last() {
-            Some((location, Reference::Define)) => Some(location.clone()),
-            _ => None,
-        };
-        self.value = true;
-        self.references.push((Location::new(url, W(&node).into()), Reference::Define));
-        location
+    fn define(&mut self, url: &Url, node: W<Node>) -> std::result::Result<(), Diagnostic> {
+        match self.references.last() {
+            Some((location, Reference::Define)) => Err(node.error_with(
+                "error: macro redefinition",
+                Some(vec![DiagnosticRelatedInformation {
+                    location: location.clone(),
+                    message: "note: defined here".into(),
+                }]),
+            )),
+            _ => {
+                self.value = true;
+                self.references.push((Location::new(url.clone(), node.into()), Reference::Define));
+                Ok(())
+            },
+        }
     }
 
-    fn undefine(&mut self, url: Url, node: Node) -> Option<Option<Location>> {
-        let location = match self.references.last() {
-            Some((location, Reference::Undef)) => Some(Some(location.clone())),
-            Some((_, Reference::Define)) => None,
-            _ => Some(None),
-        };
-        self.value = false;
-        self.references.push((Location::new(url, W(&node).into()), Reference::Undef));
-        location
+    fn undefine(&mut self, url: &Url, node: W<Node>) -> std::result::Result<(), Diagnostic> {
+        match self.references.last() {
+            Some((location, Reference::Undef)) => Err(Some(location.clone())),
+            Some((_, Reference::Define)) => {
+                self.value = false;
+                self.references.push((Location::new(url.clone(), node.into()), Reference::Undef));
+                Ok(())
+            },
+            _ => Err(None),
+        }.map_err(|location| node.error_with(
+            "error: trying to undefine undefined macro",
+            location.map(|location| vec![DiagnosticRelatedInformation {
+                location,
+                message: "note: last undefined".into(),
+            }])
+        ))
     }
 
 }
 
+static NULL: OnceCell<Tree> = OnceCell::const_new();
+
 #[derive(Debug)]
 struct FileInfo {
+    url: Url,
     version: i32,
     content: String,
     tree: Tree,
@@ -71,19 +89,181 @@ struct FileInfo {
     once: bool,
 }
 
+type IfStack<'tree> = Vec<(bool, W<Node<'tree>>, Option<W<Node<'tree>>>)>;
+
 impl FileInfo {
-    fn new(version: i32, parser: &mut Parser, content: String) -> Result<Self> {
+
+    fn new(url: Url, version: i32, content: String, parser: &mut Parser) -> Result<Self> {
         let tree = parser.parse(content.as_bytes(), None).ok_or(Error::Parse)?;
         Ok(FileInfo {
+            url,
             version,
             content,
             tree,
-            diagnostics: Vec::default(),
-            definitions: HashMap::default(),
-            semantic_tokens: Vec::default(),
-            once: bool::default(),
+            diagnostics: Default::default(),
+            definitions: Default::default(),
+            semantic_tokens: Default::default(),
+            once: Default::default(),
         })
     }
+
+    fn preprocessor_pass(&mut self) {
+        let tree = std::mem::replace(&mut self.tree, NULL.get().expect("null tree is not initialized").clone());
+        let mut cursor = tree.walk();
+        let mut if_stack = vec![];
+        let mut run = true;
+        while run {
+            let traverse = self.preprocessor_directive(cursor.node().into(), &mut if_stack);
+            match traverse {
+                Err(diagnostic) => self.diagnostics.push(diagnostic),
+                Ok(true) => {
+                    if cursor.goto_first_child() {
+                        continue;
+                    }
+                },
+                _ => {},
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    run = false;
+                    break;
+                }
+            }
+        }
+        for (_, n_if, n_else) in if_stack {
+            self.diagnostics.push(n_if.error_with(
+                "error: missing #endif directive",
+                n_else.map(|e| e.related(&self.url, "note: #else here"))
+            ));
+        }
+        drop(cursor);
+        self.tree = tree;
+    }
+
+    fn preprocess_expression(&self, node: W<Node>) -> std::result::Result<bool, Diagnostic> {
+        Ok(match node.kind() {
+            "string" => node.is_empty(),
+            "decimal" => node
+                .text(self.content.as_bytes())?
+                .parse::<i32>()
+                .unwrap_or_default() != 0,
+            "identifier" => {
+                let text = node.text(self.content.as_bytes())?;
+                self.definitions.get(text).ok_or_else(|| node.error("undefined"))?.value
+            },
+            "not" => {
+                !self.preprocess_expression(node.expect("right")?)?
+            },
+            "and" => {
+                self.preprocess_expression(node.expect("left")?)?
+                &&
+                self.preprocess_expression(node.expect("right")?)?
+            },
+            "or" => {
+                self.preprocess_expression(node.expect("left")?)?
+                ||
+                self.preprocess_expression(node.expect("right")?)?
+            },
+            "call" => {
+                let argument = node.expect("arguments")?;
+                match node.expect("name")?.text(self.content.as_bytes())? {
+                    "exists" => self.preprocess_expression(argument)?,
+                    "file_exists" => self.find_file(node)?,
+                    _ => {
+                        return Err(node.error("unknown macro function"));
+                    }
+                }
+            },
+            _ => {
+                return Err(node.error("unknown macro expression"));
+            }
+        })
+    }
+
+    fn find_file(&self, node: W<Node>) -> std::result::Result<bool, Diagnostic> {
+        let string = node.text(self.content.as_bytes())?;
+        let filename = string.get(1..string.len() - 1).ok_or_else(|| node.error("not a string literal"))?;
+        let path = Path::new(filename);
+        if path.exists() {
+            return Ok(true);
+        }
+        self.url.to_file_path().ok()
+            .and_then(|x| x.parent().map(|x| x.to_owned()))
+            .map(|x| x.join(path).exists())
+            .ok_or_else(|| node.error("could not fild file"))
+    }
+
+    fn preprocessor_directive<'tree>(&mut self, node: W<Node<'tree>>, if_stack: &mut IfStack<'tree>) -> std::result::Result<bool, Diagnostic> {
+        let skip = if_stack.last().map(|(if_condition, _, n_else)| *if_condition == n_else.is_none()).unwrap_or_default();
+        match node.kind() {
+            "preprocessor_define" => if !skip {
+                let variable = node.expect("variable")?;
+                let text = variable.text(self.content.as_bytes())?.to_owned();
+                let entry = self.definitions.entry(text).or_default();
+                entry.define(&self.url, variable)?;
+            },
+            "preprocessor_import" => if !skip {
+                let variable = node.expect("variable")?;
+                let text = variable.text(self.content.as_bytes())?.to_owned();
+                let entry = self.definitions.entry(text).or_default();
+                entry.define(&self.url, variable)?;
+            },
+            "preprocessor_undef" => if !skip {
+                let variable = node.expect("variable")?;
+                let text = variable.text(self.content.as_bytes())?.to_owned();
+                let entry = self.definitions.entry(text).or_default();
+                entry.undefine(&self.url, variable)?;
+            },
+            "preprocessor_once" => if !skip { self.once = true; },
+            "preprocessor_if" => {
+                let condition = node.expect("condition")?;
+                let result = self.preprocess_expression(condition);
+                if_stack.push((result.unwrap_or_default(), node, None));
+            },
+            "preprocessor_else" => {
+                match if_stack.last() {
+                    Some((_, _, None)) => {
+                        if let Some(last) = if_stack.last_mut() {
+                            last.2 = Some(node);
+                        }
+                    },
+                    Some((_, _, Some(n_else))) => {
+                        return Err(node.error_with(
+                            "error: duplicate #else directive",
+                            Some(n_else.related(&self.url, "note: previous #else here"))
+                        ));
+                    },
+                    None => {
+                        return Err(node.error("error: missing #if directive"));
+                    },
+                };
+            },
+            "preprocessor_endif" => {
+                let last = if_stack.last().ok_or_else(|| node.error("expected #if"))?;
+                if let Some((start, end)) = match last {
+                    (true, _, None) => None,
+                    (true, _, Some(n_else)) => Some((n_else, node)),
+                    (false, n_if, n_else) => Some((n_if, n_else.unwrap_or(node))),
+                } {
+                    for line in start.end_position().row + 1..end.start_position().row {
+                        self.semantic_tokens.push(SemanticToken {
+                            delta_line: line as u32,
+                            delta_start: 0,
+                            length: u32::max_value(),
+                            token_type: 0,
+                            token_modifiers_bitset: 0,
+                        });
+                    }
+                }
+                if_stack.pop();
+            },
+            _ => {
+                return Ok(true);
+            },
+        }
+        Ok(false)
+    }
+
 }
 
 struct Backend {
@@ -98,236 +278,37 @@ impl Backend {
     async fn process_file(&self, url: Url, content: String, version: i32) -> Result<()> {
         let entry = self.files.entry(url.clone());
         let mut parser = self.parsers.get().await?;
-        let mut scope = entry.insert(FileInfo::new(version, parser.deref_mut(), content)?);
-        self.syntax_pass(&mut scope).await;
-        self.preprocessor_pass(url.clone(), &mut scope).await?;
-        self.client.publish_diagnostics(url.clone(), scope.diagnostics.clone(), Some(scope.version)).await;
+        let mut scope = entry.insert(FileInfo::new(url.clone(), version, content, parser.deref_mut())?);
+        self.syntax_pass(&mut scope);
+        scope.preprocessor_pass();
+        self.client.publish_diagnostics(
+            url,
+            scope.diagnostics.clone(),
+            Some(scope.version)
+        ).await;
         Ok(())
     }
 
-    async fn syntax_pass(&self, scope: &mut FileInfo) {
+    fn syntax_pass(&self, scope: &mut FileInfo) {
         let mut cursor = QueryCursor::new();
         let matches = cursor.matches(&self.queries.error, scope.tree.root_node(), scope.content.as_bytes());
         scope.diagnostics.extend(
             matches
             .filter_map(|m| m.captures.first())
-            .map(|c| Diagnostic::new(
-                W(&c.node).into(),
-                Some(DiagnosticSeverity::ERROR),
-                None,
-                None,
-                "Syntax Error".into(),
-                None,
-                None,
-            ))
+            .map(|c| W(c.node).error("Syntax Error"))
         );
     }
 
-    async fn preprocessor_pass(&self, url: Url, scope: &mut FileInfo) -> Result<()> {
-        let mut cursor = scope.tree.walk();
-        let mut if_stack: Vec<(bool, Node, Option<Node>)> = vec![];
-        let mut run = true;
-        while run {
-            let skip = if_stack.last().map(|(if_condition, _, n_else)| *if_condition == n_else.is_none()).unwrap_or_default();
-            let node = cursor.node();
-            match node.kind() {
-                "preprocessor_define" => if !skip {
-                    let variable = node.child_by_field_name("variable").ok_or(Error::Parse)?;
-                    let text = variable.utf8_text(scope.content.as_bytes())?.to_owned();
-                    let entry = scope.definitions.entry(text).or_default();
-                    if let Some(location) = entry.define(url.clone(), variable) {
-                        scope.diagnostics.push(Diagnostic::new(
-                            W(&variable).into(),
-                            Some(DiagnosticSeverity::ERROR),
-                            None,
-                            None,
-                            "error: macro redefinition".into(),
-                            Some(vec![DiagnosticRelatedInformation {
-                                location,
-                                message: "note: defined here".into(),
-                            }]),
-                            None,
-                        ));
-                    }
-                },
-                "preprocessor_import" => if !skip {
-                    let variable = node.child_by_field_name("variable").ok_or(Error::Parse)?;
-                    let text = variable.utf8_text(scope.content.as_bytes())?.to_owned();
-                    let entry = scope.definitions.entry(text).or_default();
-                    if let Some(location) = entry.define(url.clone(), variable) {
-                        scope.diagnostics.push(Diagnostic::new(
-                            W(&variable).into(),
-                            Some(DiagnosticSeverity::ERROR),
-                            None,
-                            None,
-                            "error: macro redefinition".into(),
-                            Some(vec![DiagnosticRelatedInformation {
-                                location,
-                                message: "note: defined here".into(),
-                            }]),
-                            None,
-                        ));
-                    }
-                },
-                "preprocessor_undef" => if !skip {
-                    let variable = node.child_by_field_name("variable").ok_or(Error::Parse)?;
-                    let text = variable.utf8_text(scope.content.as_bytes())?.to_owned();
-                    let entry = scope.definitions.entry(text).or_default();
-                    if let Some(location) = entry.undefine(url.clone(), variable) {
-                        scope.diagnostics.push(Diagnostic::new(
-                            W(&variable).into(),
-                            Some(DiagnosticSeverity::ERROR),
-                            None,
-                            None,
-                            "error: trying to undefine undefined macro".into(),
-                            location.map(|location| vec![DiagnosticRelatedInformation {
-                                location,
-                                message: "note: last undefined".into(),
-                            }]),
-                            None,
-                        ));
-                    }
-                },
-                "preprocessor_once" => if !skip { scope.once = true; },
-                "preprocessor_if" => {
-                    let condition = node.child_by_field_name("condition").ok_or(Error::Parse)?;
-                    let result = self.preprocess_expression(&url, scope, condition)?;
-                    if_stack.push((result, node, None));
-                },
-                "preprocessor_else" => {
-                    match if_stack.last() {
-                        Some((_, _, None)) => {
-                            if let Some(last) = if_stack.last_mut() {
-                                last.2 = Some(node);
-                            }
-                        },
-                        Some((_, _, Some(n_else))) => {
-                            scope.diagnostics.push(Diagnostic::new(
-                                W(&node).into(),
-                                Some(DiagnosticSeverity::ERROR),
-                                None,
-                                None,
-                                "error: duplicate #else directive".into(),
-                                Some(vec![DiagnosticRelatedInformation {
-                                    location: Location::new(url.clone(), W(n_else).into()),
-                                    message: "note: previous #else here".into(),
-                                }]),
-                                None,
-                            ));
-                        },
-                        None => {
-                            scope.diagnostics.push(Diagnostic::new(
-                                W(&node).into(),
-                                Some(DiagnosticSeverity::ERROR),
-                                None,
-                                None,
-                                "error: missing #if directive".into(),
-                                None,
-                                None,
-                            ));
-                        },
-                    };
-                },
-                "preprocessor_endif" => {
-                    let last = if_stack.last().ok_or(Error::Parse)?;
-                    if let Some((start, end)) = match last {
-                        (true, _, None) => None,
-                        (true, _, Some(n_else)) => Some((n_else, node)),
-                        (false, n_if, n_else) => Some((n_if, n_else.unwrap_or(node))),
-                    } {
-                        for line in start.end_position().row + 1..end.start_position().row {
-                            scope.semantic_tokens.push(SemanticToken {
-                                delta_line: line as u32,
-                                delta_start: 0,
-                                length: u32::max_value(),
-                                token_type: 0,
-                                token_modifiers_bitset: 0,
-                            });
-                        }
-                    }
-                    if_stack.pop();
-                },
-                _ => {
-                    if cursor.goto_first_child() {
-                        continue;
-                    }
-                },
-            }
-            while !cursor.goto_next_sibling() {
-                if !cursor.goto_parent() {
-                    run = false;
-                    break;
-                }
-            }
-        }
-        for (_, n_if, n_else) in if_stack {
-            scope.diagnostics.push(Diagnostic::new(
-                W(&n_if).into(),
-                Some(DiagnosticSeverity::ERROR),
-                None,
-                None,
-                "error: missing #endif directive".into(),
-                n_else.map(|e| vec![DiagnosticRelatedInformation {
-                    message: "note: #else here".into(),
-                    location: Location::new(url.clone(), W(&e).into()),
-                }]),
-                None,
-            ));
-        }
-        Ok(())
-    }
-
-    fn preprocess_expression(&self, url: &Url, scope: &FileInfo, node: Node) -> Result<bool> {
-        Ok(match node.kind() {
-            "string" => W(node).is_empty(),
-            "decimal" => node
-                .utf8_text(scope.content.as_bytes())?
-                .parse::<i32>()
-                .unwrap_or_default() != 0,
-            "identifier" => {
-                let text = node.utf8_text(scope.content.as_bytes())?;
-                let symbol = scope.definitions.get(text).ok_or(Error::SymbolNotFound)?;
-                symbol.value
-            },
-            "not" => {
-                !self.preprocess_expression(url, scope, node.named_child(1).ok_or(Error::Parse)?)?
-            },
-            "and" => {
-                self.preprocess_expression(url, scope, node.child_by_field_name("left").ok_or(Error::Parse)?)?
-                &&
-                self.preprocess_expression(url, scope, node.child_by_field_name("right").ok_or(Error::Parse)?)?
-            },
-            "or" => {
-                self.preprocess_expression(url, scope, node.child_by_field_name("left").ok_or(Error::Parse)?)?
-                ||
-                self.preprocess_expression(url, scope, node.child_by_field_name("right").ok_or(Error::Parse)?)?
-            },
-            "call" => {
-                let argument = node.child_by_field_name("arguments").ok_or(Error::Parse)?;
-                match node.child_by_field_name("name").ok_or(Error::Parse)?.utf8_text(scope.content.as_bytes())? {
-                    "exists" => self.preprocess_expression(url, scope, argument)?,
-                    "file_exists" => {
-                        let string = node.utf8_text(scope.content.as_bytes())?;
-                        self.find_file(url, string.get(1..string.len() - 1).ok_or(Error::Parse)?)?
-                    },
-                    _ => {
-                        return Err(Box::new(Error::Parse));
-                    }
-                }
-            },
-            _ => {
-                return Err(Box::new(Error::Parse));
-            }
-        })
-    }
-
-    fn find_file(&self, url: &Url, filename: &str) -> Result<bool> {
-        let path = Path::new(filename);
-        if path.exists() {
-            return Ok(true);
-        }
-        let parent = url.to_file_path().map_err(|_| Error::FileNotFound)?;
-        Ok(parent.parent().ok_or(Error::FileNotFound)?.join(path).exists())
+    fn new(client: Client) -> Result<Self> {
+        let language = tree_sitter_fastbuild::language();
+        let queries = Queries::new(&language)?;
+        let mut parser = Parser::new();
+        parser.set_language(&language)?;
+        let tree = parser.parse("", None).ok_or(Error::Parse)?;
+        let _ = NULL.set(tree);
+        let parsers = new_pool(language)?;
+        let files = DashMap::new();
+        Ok(Backend { client, parsers, files, queries })
     }
 
 }
@@ -415,7 +396,7 @@ impl LanguageServer for Backend {
         let mut prev = SemanticToken::default();
         Ok(self.files
             .get(&params.text_document.uri)
-            .map(|f| f.semantic_tokens.iter().map(|t| W(t).delta(&mut prev)).collect())
+            .map(|f| f.semantic_tokens.iter().map(|t| W(*t).delta(&mut prev)).collect())
             .map(|t| SemanticTokensResult::Tokens(SemanticTokens {
                 data: t,
                 ..Default::default()
@@ -453,18 +434,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
-    let language = tree_sitter_fastbuild::language();
-    let queries = Queries::new(&language)?;
-    let parsers = new_pool(language)?;
-    let files = DashMap::new();
-
     info!("starting LSP server");
-    let (service, socket) = LspService::new(|client| Backend {
-        client,
-        parsers,
-        files,
-        queries,
-    });
+    let (service, socket) = LspService::new(|c| Backend::new(c).expect("failed to initialize backend"));
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
@@ -478,16 +449,7 @@ mod tests {
     use super::*;
 
     async fn make() -> LspService<Backend> {
-        let language = tree_sitter_fastbuild::language();
-        let queries = Queries::new(&language).expect("failed to load queries");
-        let parsers = new_pool(language).expect("failed to create parser pool");
-        let files = DashMap::new();
-        let (service, _) = LspService::new(|client| Backend {
-            client,
-            files,
-            parsers,
-            queries,
-        });
+        let (service, _) = LspService::new(|client| Backend::new(client).expect("failed to initialize backend"));
         let backend = service.inner();
         backend.initialize(InitializeParams::default()).await.expect("failed to initialize server");
         backend.initialized(InitializedParams{}).await;
