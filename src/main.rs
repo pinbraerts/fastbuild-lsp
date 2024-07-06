@@ -521,6 +521,10 @@ mod tests {
         let scope = backend.files.get(&uri).expect("no file");
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
         assert_eq!(diagnostic.message, "trying to undefine undefined macro");
+        assert_eq!(diagnostic.range.start.line, 0);
+        assert_eq!(diagnostic.range.start.character, 7);
+        assert_eq!(diagnostic.range.end.line, 0);
+        assert_eq!(diagnostic.range.end.character, 8);
     }
 
     #[tokio::test]
@@ -563,6 +567,46 @@ mod tests {
         assert_eq!(token.length, u32::max_value(), "mismatching length");
         assert_eq!(token.token_modifiers_bitset, 0, "mismatching modifiers");
         assert_eq!(token.token_type, 0, "mismatching types");
+    }
+
+    #[tokio::test]
+    #[tokio::test]
+    async fn preprocessor_if_missing() {
+        let (uri, service) = make_with_file("memory://preprocessor_if_missing.bff", "#else").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        let diagnostic = scope.diagnostics.first().expect("no diagnostic");
+        assert_eq!(diagnostic.message, "expected #if");
+        assert_eq!(diagnostic.range.start.line, 0);
+        assert_eq!(diagnostic.range.start.character, 1);
+        assert_eq!(diagnostic.range.end.line, 0);
+        assert_eq!(diagnostic.range.end.character, 5);
+    }
+
+    #[tokio::test]
+    async fn preprocessor_endif_missing() {
+        let (uri, service) = make_with_file("memory://preprocessor_if_missing.bff", "#if 1").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        let diagnostic = scope.diagnostics.first().expect("no diagnostic");
+        assert_eq!(diagnostic.message, "expected #endif");
+        assert_eq!(diagnostic.range.start.line, 0);
+        assert_eq!(diagnostic.range.start.character, 1);
+        assert_eq!(diagnostic.range.end.line, 0);
+        assert_eq!(diagnostic.range.end.character, 5);
+    }
+
+    #[tokio::test]
+    async fn preprocessor_unknown() {
+        let (uri, service) = make_with_file("memory://preprocessor_unknown.bff", "#unknown").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        let diagnostic = scope.diagnostics.first().expect("no diagnostic");
+        assert_eq!(diagnostic.message, "unknown directive");
+        assert_eq!(diagnostic.range.start.line, 0);
+        assert_eq!(diagnostic.range.start.character, 1);
+        assert_eq!(diagnostic.range.end.line, 0);
+        assert_eq!(diagnostic.range.end.character, 8);
     }
 
 }
