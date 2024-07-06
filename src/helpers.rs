@@ -1,7 +1,7 @@
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location, Position, Range, SemanticToken};
 use tree_sitter::{Point, Node};
 use url::Url;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Default)]
 pub struct W<T>(pub T);
@@ -17,6 +17,12 @@ impl<T> Deref for W<T> {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl<T> DerefMut for W<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
@@ -111,27 +117,23 @@ impl<'tree> W<Node<'tree>> {
     pub fn expect(self, name: &str) -> std::result::Result<Self, Diagnostic> {
         self.child_by_field_name(name)
             .map(Self)
-            .ok_or_else(|| self.error(format!("expected {}", name)))
+            .ok_or_else(|| self.error(format!("expected {}", name)).0)
     }
 
     pub fn text(self, content: &[u8]) -> std::result::Result<&str, Diagnostic> {
-        self.utf8_text(content).map_err(|_| self.error("non-unicode text"))
+        self.utf8_text(content).map_err(|_| self.error("non-unicode text").0)
     }
 
-    pub fn error(self, message: impl Into<String>) -> Diagnostic {
-        self.error_with(message, None)
-    }
-
-    pub fn error_with(self, message: impl Into<String>, related: Option<Vec<DiagnosticRelatedInformation>>) -> Diagnostic {
+    pub fn error(self, message: impl Into<String>) -> W<Diagnostic> {
         Diagnostic::new(
             self.into(),
             Some(DiagnosticSeverity::ERROR),
             None,
             None,
             message.into(),
-            related,
             None,
-        )
+            None,
+        ).into()
     }
 
     pub fn related(self, url: &Url, message: impl Into<String>) -> Vec<DiagnosticRelatedInformation> {
@@ -143,6 +145,15 @@ impl<'tree> W<Node<'tree>> {
 
     pub fn url(self, url: &Url) -> Location {
         Location::new(url.clone(), self.into())
+    }
+
+}
+
+impl W<Diagnostic> {
+
+    pub fn with(mut self, related: Option<Vec<DiagnosticRelatedInformation>>) -> Self {
+        self.related_information = related;
+        self
     }
 
 }

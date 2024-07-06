@@ -38,15 +38,14 @@ struct Symbol {
 
 impl Symbol {
 
-    fn define(&mut self, url: &Url, node: W<Node>) -> std::result::Result<(), Diagnostic> {
+    fn define(&mut self, url: &Url, node: W<Node>) -> std::result::Result<(), W<Diagnostic>> {
         match self.references.last() {
-            Some((location, Reference::Define)) => Err(node.error_with(
-                "error: macro redefinition",
-                Some(vec![DiagnosticRelatedInformation {
-                    location: location.clone(),
-                    message: "note: defined here".into(),
-                }]),
-            )),
+            Some((location, Reference::Define)) => Err(node.error(
+                "macro redefinition"
+            ).with(Some(vec![DiagnosticRelatedInformation {
+                location: location.clone(),
+                message: "defined here".into(),
+            }]))),
             _ => {
                 self.value = true;
                 self.references.push((Location::new(url.clone(), node.into()), Reference::Define));
@@ -55,7 +54,7 @@ impl Symbol {
         }
     }
 
-    fn undefine(&mut self, url: &Url, node: W<Node>) -> std::result::Result<(), Diagnostic> {
+    fn undefine(&mut self, url: &Url, node: W<Node>) -> std::result::Result<(), W<Diagnostic>> {
         match self.references.last() {
             Some((location, Reference::Undef)) => Err(Some(location.clone())),
             Some((_, Reference::Define)) => {
@@ -64,13 +63,12 @@ impl Symbol {
                 Ok(())
             },
             _ => Err(None),
-        }.map_err(|location| node.error_with(
-            "error: trying to undefine undefined macro",
-            location.map(|location| vec![DiagnosticRelatedInformation {
+        }.map_err(|location| node.error("trying to undefine undefined macro")
+            .with(location.map(|location| vec![DiagnosticRelatedInformation {
                 location,
                 message: "note: last undefined".into(),
-            }])
-        ))
+            }]))
+        )
     }
 
 }
@@ -115,7 +113,7 @@ impl FileInfo {
         while run {
             let traverse = self.preprocessor_directive(cursor.node().into(), &mut if_stack);
             match traverse {
-                Err(diagnostic) => self.diagnostics.push(diagnostic),
+                Err(diagnostic) => self.diagnostics.push(diagnostic.0),
                 Ok(true) => {
                     if cursor.goto_first_child() {
                         continue;
@@ -131,16 +129,15 @@ impl FileInfo {
             }
         }
         for (_, n_if, n_else) in if_stack {
-            self.diagnostics.push(n_if.error_with(
-                "error: missing #endif directive",
-                n_else.map(|e| e.related(&self.url, "note: #else here"))
-            ));
+            self.diagnostics.push(n_if.error("missing #endif directive").with(
+                n_else.map(|e| e.related(&self.url, "#else here"))
+            ).0);
         }
         drop(cursor);
         self.tree = tree;
     }
 
-    fn preprocess_expression(&self, node: W<Node>) -> std::result::Result<bool, Diagnostic> {
+    fn preprocess_expression(&self, node: W<Node>) -> std::result::Result<bool, W<Diagnostic>> {
         Ok(match node.kind() {
             "string" => node.is_empty(),
             "decimal" => node
@@ -180,7 +177,7 @@ impl FileInfo {
         })
     }
 
-    fn find_file(&self, node: W<Node>) -> std::result::Result<bool, Diagnostic> {
+    fn find_file(&self, node: W<Node>) -> std::result::Result<bool, W<Diagnostic>> {
         let string = node.text(self.content.as_bytes())?;
         let filename = string.get(1..string.len() - 1).ok_or_else(|| node.error("not a string literal"))?;
         let path = Path::new(filename);
@@ -193,7 +190,7 @@ impl FileInfo {
             .ok_or_else(|| node.error("could not fild file"))
     }
 
-    fn preprocessor_directive<'tree>(&mut self, node: W<Node<'tree>>, if_stack: &mut IfStack<'tree>) -> std::result::Result<bool, Diagnostic> {
+    fn preprocessor_directive<'tree>(&mut self, node: W<Node<'tree>>, if_stack: &mut IfStack<'tree>) -> std::result::Result<bool, W<Diagnostic>> {
         let skip = if_stack.last().map(|(if_condition, _, n_else)| *if_condition == n_else.is_none()).unwrap_or_default();
         match node.kind() {
             "preprocessor_define" => if !skip {
@@ -228,13 +225,12 @@ impl FileInfo {
                         }
                     },
                     Some((_, _, Some(n_else))) => {
-                        return Err(node.error_with(
-                            "error: duplicate #else directive",
-                            Some(n_else.related(&self.url, "note: previous #else here"))
+                        return Err(node.error("duplicate #else directive").with(
+                            Some(n_else.related(&self.url, "previous #else here"))
                         ));
                     },
                     None => {
-                        return Err(node.error("error: missing #if directive"));
+                        return Err(node.error("missing #if directive"));
                     },
                 };
             },
@@ -295,7 +291,7 @@ impl Backend {
         scope.diagnostics.extend(
             matches
             .filter_map(|m| m.captures.first())
-            .map(|c| W(c.node).error("Syntax Error"))
+            .map(|c| W(c.node).error("Syntax Error").0)
         );
     }
 
@@ -486,10 +482,10 @@ mod tests {
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
-        assert_eq!(diagnostic.message, "error: macro redefinition");
+        assert_eq!(diagnostic.message, "macro redefinition");
         let binding = diagnostic.related_information.clone().expect("no related information");
         let related = binding.first().expect("no related entrys");
-        assert_eq!(related.message, "note: defined here");
+        assert_eq!(related.message, "defined here");
         assert_eq!(related.location.uri, uri);
         assert_eq!(related.location.range.start, Position::new(0, 8));
         assert_eq!(related.location.range.end, Position::new(0, 9));
@@ -501,10 +497,10 @@ mod tests {
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
-        assert_eq!(diagnostic.message, "error: macro redefinition");
+        assert_eq!(diagnostic.message, "macro redefinition");
         let binding = diagnostic.related_information.clone().expect("no related information");
         let related = binding.first().expect("no related entrys");
-        assert_eq!(related.message, "note: defined here");
+        assert_eq!(related.message, "defined here");
         assert_eq!(related.location.uri, uri);
         assert_eq!(related.location.range.start, Position::new(0, 8));
         assert_eq!(related.location.range.end, Position::new(0, 9));
@@ -524,7 +520,7 @@ mod tests {
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
-        assert_eq!(diagnostic.message, "error: trying to undefine undefined macro");
+        assert_eq!(diagnostic.message, "trying to undefine undefined macro");
     }
 
     #[tokio::test]
