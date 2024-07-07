@@ -320,8 +320,14 @@ impl Backend {
             "ERROR" => if !skip { Err(node.error("syntax"))? },
             "preprocessor_if" => {
                 let condition = node.expect("condition")?;
-                let result = self.preprocess_expression(url, scope, condition);
-                if_stack.push((result.unwrap_or_default(), node, None));
+                let result = match self.preprocess_expression(url, scope, condition) {
+                    Ok(result) => result,
+                    Err(diagnostic) => {
+                        scope.diagnostics.push(diagnostic.0);
+                        false
+                    },
+                };
+                if_stack.push((result, node, None));
             },
             "preprocessor_else" => {
                 match if_stack.last() {
