@@ -143,6 +143,7 @@ struct Backend {
     client: Client,
     parsers: ParserPool,
     files: DashMap<Url, Scope>,
+    builtins: HashSet<Url>,
 }
 
 impl Backend {
@@ -180,6 +181,14 @@ impl Backend {
         let mut if_stack = vec![];
         let mut run = true;
         let mut scope = Scope::new(version, content);
+        if !self.builtins.contains(&url) {
+            for builtin_url in self.builtins.iter() {
+                if let Some(file_scope) = self.files.get(builtin_url) {
+                    scope.definitions.extend(file_scope.definitions.clone());
+                    scope.references.insert(builtin_url.clone());
+                }
+            }
+        }
         while run {
             let traverse = self.enter_node(&url, &mut scope, cursor.node().into(), &mut if_stack).await;
             match traverse {
@@ -372,6 +381,16 @@ impl Backend {
     }
 
     fn new(client: Client) -> Result<Self> {
+        let builtin_dir = PathBuf::from("/home/pinbraerts/src/fastbuild-lsp/builtins");
+        if !builtin_dir.exists() {
+            Err(Error::FileNotFound)?;
+        }
+        let platform = format!("{}.bff", std::env::consts::OS);
+        let builtin_files = [
+            "aliases.bff",
+            &platform,
+        ];
+        let builtins = builtin_files.iter().filter_map(|f| Url::from_file_path(builtin_dir.join(f)).ok()).collect();
         let language = tree_sitter_fastbuild::language();
         let mut parser = Parser::new();
         parser.set_language(&language)?;
@@ -379,7 +398,7 @@ impl Backend {
         let _ = NULL.set(tree);
         let parsers = new_pool(language)?;
         let files = DashMap::new();
-        Ok(Backend { client, parsers, files })
+        Ok(Backend { client, parsers, files, builtins })
     }
 
 }
@@ -388,6 +407,9 @@ impl Backend {
 impl LanguageServer for Backend {
 
     async fn initialize(&self, _: InitializeParams) -> jsonrpc::Result<InitializeResult> {
+        for url in self.builtins.iter() {
+            let _ = self.on_file_open(url.clone()).await;
+        }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 // declaration_provider: Some(DeclarationCapability::Simple(true)),
@@ -427,8 +449,7 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        self.client.log_message(MessageType::INFO, "server initialized!")
-        .await;
+        self.client.log_message(MessageType::INFO, "server initialized!").await;
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
@@ -634,6 +655,7 @@ mod tests {
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let token = scope.semantic_tokens.first().expect("no semantic tokens");
+        assert_eq!(scope.diagnostics, vec![]);
         assert_eq!(token.delta_line, 6, "mismatching lines");
         assert_eq!(token.delta_start, 0, "mismatching columns");
         assert_eq!(token.length, u32::max_value(), "mismatching length");
@@ -694,6 +716,31 @@ mod tests {
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         assert_eq!(scope.diagnostics, vec![]);
+    }
+
+    #[tokio::test]
+    async fn os() {
+        let (uri, service) = make_with_file("memory://os.bff", "").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        match std::env::consts::OS {
+            "linux" => {
+                assert!(matches!(scope.definitions.get("__LINUX__"), Some(Symbol { value: true, .. })));
+                assert!(scope.definitions.get("__WINDOWS__").is_none());
+                assert!(scope.definitions.get("__OSX__").is_none());
+            },
+            "macos" => {
+                assert!(scope.definitions.get("__LINUX__").is_none());
+                assert!(scope.definitions.get("__WINDOWS__").is_none());
+                assert!(matches!(scope.definitions.get("__OSX__"), Some(Symbol { value: true, .. })));
+            },
+            "windows" => {
+                assert!(scope.definitions.get("__LINUX__").is_none());
+                assert!(matches!(scope.definitions.get("__WINDOWS__"), Some(Symbol { value: true, .. })));
+                assert!(scope.definitions.get("__OSX__").is_none());
+            },
+            _ => {},
+        }
     }
 
 }
