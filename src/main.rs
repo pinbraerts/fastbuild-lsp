@@ -325,15 +325,16 @@ impl Backend {
                     (true, _, Some(n_else)) => Some((n_else, node)),
                     (false, n_if, n_else) => Some((n_if, n_else.unwrap_or(node))),
                 } {
-                    for line in start.end_position().row + 1..end.start_position().row {
-                        scope.semantic_tokens.push(SemanticToken {
-                            delta_line: line as u32,
-                            delta_start: 0,
-                            length: u32::max_value(),
-                            token_type: 0,
-                            token_modifiers_bitset: 0,
-                        });
-                    }
+                    scope.semantic_tokens.extend(
+                        (start.end_position().row + 1..end.start_position().row)
+                            .map(|line| SemanticToken {
+                                delta_line: line as u32,
+                                delta_start: 0,
+                                length: u32::max_value(),
+                                token_type: 0,
+                                token_modifiers_bitset: 0,
+                            })
+                    );
                 }
                 if_stack.pop();
             },
