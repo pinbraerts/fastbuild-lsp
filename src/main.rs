@@ -14,6 +14,7 @@ use tree_sitter::{Node, Parser, Tree};
 use tokio::fs::File;
 
 use std::collections::HashMap;
+use std::env::VarError::NotPresent;
 use std::path::PathBuf;
 
 use parser_pool::ParserPool;
@@ -127,6 +128,14 @@ impl Scope {
         self.definitions.entry(name.into()).or_default().reference(url, node)
     }
 
+    fn find_env_variable(&self, node: W<Node>) -> std::result::Result<(), W<Diagnostic>> {
+        let name = node.text(self.content.as_bytes())?;
+        match std::env::var(name) {
+            Err(NotPresent) => Err(node.error("environment variable not found")),
+            _ => Ok(()),
+        }
+    }
+
 }
 
 struct Backend {
@@ -233,12 +242,10 @@ impl Backend {
             "function_call" => {
                 let argument = node.expect("arguments")?;
                 match node.expect("name")?.text(scope.content.as_bytes())? {
-                    "exists" => self.preprocess_expression(url, scope, argument)?,
-                    "file_exists" => self.find_file(url, scope, argument).and(Ok(true))?,
-                    _ => {
-                        return Err(node.error("unknown macro function"));
-                    }
-                }
+                    "exists" => scope.find_env_variable(argument),
+                    "file_exists" => self.find_file(url, scope, argument).and(Ok(())),
+                    _ => Err(node.error("unknown macro function")),
+                }.and(Ok(true))?
             },
             _ => {
                 return Err(node.error("unknown macro expression"));
@@ -279,7 +286,7 @@ impl Backend {
                 scope.define(url, node.expect("variable")?)?;
             },
             "preprocessor_import" => if !skip {
-                scope.define(url, node.expect("variable")?)?;
+                scope.find_env_variable(node.expect("variable")?)?;
             },
             "preprocessor_undef" => if !skip {
                 scope.undefine(url, node.expect("variable")?)?;
@@ -528,18 +535,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reimport() {
-        let (uri, service) = make_with_file("memory://reimport.bff", "#import A\n#define A").await;
+    async fn import_not_found() {
+        let (uri, service) = make_with_file("memory://import_not_found.bff", "#import __SURELYNOSUCHENVVAR").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
-        assert_eq!(diagnostic.message, "macro redefinition");
-        let binding = diagnostic.related_information.clone().expect("no related information");
-        let related = binding.first().expect("no related entrys");
-        assert_eq!(related.message, "defined here");
-        assert_eq!(related.location.uri, uri);
-        assert_eq!(related.location.range.start, Position::new(0, 8));
-        assert_eq!(related.location.range.end, Position::new(0, 9));
+        assert_eq!(diagnostic.message, "environment variable not found");
+        assert_eq!(diagnostic.range.start.line, 0);
+        assert_eq!(diagnostic.range.start.character, 8);
+        assert_eq!(diagnostic.range.end.line, 0);
+        assert_eq!(diagnostic.range.end.character, 28);
     }
 
     #[tokio::test]
@@ -564,8 +569,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn undef_import() {
-        let (uri, service) = make_with_file("memory://undef_import.bff", "#import A\n#undef A").await;
+    async fn import() {
+        let (uri, service) = make_with_file("memory://import.bff", "#import PATH").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         assert_eq!(scope.diagnostics, vec!());
