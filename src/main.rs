@@ -4,7 +4,7 @@ pub mod helpers;
 
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
-use futures::future::BoxFuture;
+use futures::future::{join_all, BoxFuture};
 use futures::FutureExt;
 use helpers::W;
 use tokio::io::AsyncReadExt;
@@ -13,7 +13,7 @@ use tree_sitter::{Node, Parser, Tree};
 
 use tokio::fs::File;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env::VarError::NotPresent;
 use std::path::PathBuf;
 
@@ -103,6 +103,7 @@ struct Scope {
     semantic_tokens: Vec<SemanticToken>,
     once: bool,
     content: String,
+    references: HashSet<Url>,
 }
 
 type IfStack<'tree> = Vec<(bool, W<Node<'tree>>, Option<W<Node<'tree>>>)>;
@@ -150,14 +151,12 @@ impl Backend {
         Ok(self.parsers.get().await?.parse(content.into(), None).ok_or(Error::Parse)?)
     }
 
-    fn on_file_open(&self, url: Url) -> BoxFuture<Result<()>> {
-        async move {
-            if let Entry::Occupied(_) = self.files.entry(url.clone()) {
-                return Ok(());
-            }
-            let content = Self::get_content(url.clone()).await.ok_or(Error::Parse)?;
-            self.on_file_update(url, 0, content).await
-        }.boxed()
+    async fn on_file_open(&self, url: Url) -> Result<()> {
+        if let Entry::Occupied(_) = self.files.entry(url.clone()) {
+            return Ok(());
+        }
+        let content = Self::get_content(url.clone()).await.ok_or(Error::Parse)?;
+        self.on_file_update(url, 0, content).await
     }
 
     async fn on_file_update(&self, url: Url, version: i32, content: String) -> Result<()> {
@@ -169,9 +168,11 @@ impl Backend {
         self.on_text_change(url, version, content).await
     }
 
-    async fn on_text_change(&self, url: Url, version: i32, content: String) -> Result<()> {
-        let tree = self.parse(content.as_bytes()).await?;
-        self.on_tree_change(url, version, content, tree).await
+    fn on_text_change(&self, url: Url, version: i32, content: String) -> BoxFuture<Result<()>> {
+        async move {
+            let tree = self.parse(content.as_bytes()).await?;
+            self.on_tree_change(url, version, content, tree).await
+        }.boxed()
     }
 
     async fn on_tree_change(&self, url: Url, version: i32, content: String, tree: Tree) -> Result<()> {
@@ -212,7 +213,18 @@ impl Backend {
             scope.diagnostics.clone(),
             Some(scope.version)
         ).await;
-        self.files.entry(url).insert(scope);
+        let _ = self.files.insert(url.clone(), scope);
+        let references: Vec<Url> = self.files.iter().filter_map(|v| if v.value().references.contains(&url) { Some(v.key().clone()) } else { None }).collect();
+        let should_refresh = !references.is_empty();
+        let items: Vec<(Url, Scope)> = references.into_iter().filter_map(|v| self.files.remove(&v)).collect();
+        let _ = join_all(
+            items
+                .into_iter()
+                .map(|(reference, scope)| self.on_text_change(reference, scope.version, scope.content))
+        ).await;
+        if should_refresh {
+            self.client.semantic_tokens_refresh().await?;
+        }
         Ok(())
     }
 
@@ -296,11 +308,12 @@ impl Backend {
                 let file_url = self.find_file(url, scope, filename)?;
                 self.on_file_open(file_url.clone()).await.map_err(|_| filename.error("could not read file"))?;
                 if let Some(file_scope) = self.files.get(&file_url) {
-                    scope.definitions = file_scope.definitions.clone();
+                    scope.definitions.extend(file_scope.definitions.clone());
                 }
                 else {
-                    Err(filename.error(""))?;
+                    Err(filename.error("error while processing file"))?;
                 }
+                scope.references.insert(file_url.clone());
             },
             "preprocessor_once" => if !skip { scope.once = true; },
             "preprocessor_unknown" => if !skip { Err(node.error("unknown directive"))? },
@@ -351,7 +364,6 @@ impl Backend {
         }
         Ok(false)
     }
-
 
     fn new(client: Client) -> Result<Self> {
         let language = tree_sitter_fastbuild::language();
