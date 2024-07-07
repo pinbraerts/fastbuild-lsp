@@ -76,7 +76,7 @@ impl Symbol {
 
     fn reference(&mut self, url: &Url, node: W<Node>) -> std::result::Result<bool, W<Diagnostic>> {
         match self.references.last() {
-            Some((location, Reference::Undef)) => Err(Some(location.clone())),
+            //Some((location, Reference::Undef)) => Err(Some(location.clone())),
             Some(_) => {
                 self.references.push((node.url(url), Reference::Ref));
                 Ok(self.value)
