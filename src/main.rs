@@ -14,7 +14,6 @@ use tree_sitter::{Node, Parser, Tree};
 use tokio::fs::File;
 
 use std::collections::HashMap;
-use std::ops::DerefMut;
 use std::path::PathBuf;
 
 use parser_pool::ParserPool;
@@ -51,7 +50,7 @@ impl Symbol {
             }]))),
             _ => {
                 self.value = true;
-                self.references.push((Location::new(url.clone(), node.into()), Reference::Define));
+                self.references.push((node.url(url), Reference::Define));
                 Ok(())
             },
         }
@@ -62,7 +61,7 @@ impl Symbol {
             Some((location, Reference::Undef)) => Err(Some(location.clone())),
             Some(_) => {
                 self.value = false;
-                self.references.push((Location::new(url.clone(), node.into()), Reference::Undef));
+                self.references.push((node.url(url), Reference::Undef));
                 Ok(())
             },
             _ => Err(None),
@@ -78,7 +77,7 @@ impl Symbol {
         match self.references.last() {
             Some((location, Reference::Undef)) => Err(Some(location.clone())),
             Some(_) => {
-                self.references.push((Location::new(url.clone(), node.into()), Reference::Ref));
+                self.references.push((node.url(url), Reference::Ref));
                 Ok(self.value)
             },
             _ => Err(None),
@@ -95,32 +94,22 @@ impl Symbol {
 static NULL: OnceCell<Tree> = OnceCell::const_new();
 type Definitions = HashMap<String, Symbol>;
 
-#[derive(Debug)]
-struct FileInfo {
+#[derive(Debug, Default)]
+struct Scope {
     version: i32,
-    content: String,
-    tree: Tree,
     diagnostics: Vec<Diagnostic>,
     definitions: Definitions,
     semantic_tokens: Vec<SemanticToken>,
     once: bool,
+    content: String,
 }
 
 type IfStack<'tree> = Vec<(bool, W<Node<'tree>>, Option<W<Node<'tree>>>)>;
 
-impl FileInfo {
+impl Scope {
 
-    fn new(version: i32, content: String, parser: &mut Parser, definitions: Definitions) -> Result<Self> {
-        let tree = parser.parse(content.as_bytes(), None).ok_or(Error::Parse)?;
-        Ok(FileInfo {
-            version,
-            content,
-            tree,
-            definitions,
-            diagnostics: Default::default(),
-            semantic_tokens: Default::default(),
-            once: Default::default(),
-        })
+    fn new(version: i32, content: String) -> Self {
+        Scope { version, content, ..Default::default() }
     }
 
     fn define(&mut self, url: &Url, node: W<Node>) -> std::result::Result<(), W<Diagnostic>> {
@@ -143,38 +132,46 @@ impl FileInfo {
 struct Backend {
     client: Client,
     parsers: ParserPool,
-    files: DashMap<Url, FileInfo>,
+    files: DashMap<Url, Scope>,
 }
 
 impl Backend {
 
-    fn process_file(&self, url: Url, content: String, version: i32, definitions: Definitions) -> BoxFuture<Result<()>> {
+    async fn parse(&self, content: impl Into<&[u8]>) -> Result<Tree> {
+        Ok(self.parsers.get().await?.parse(content.into(), None).ok_or(Error::Parse)?)
+    }
+
+    fn on_file_open(&self, url: Url) -> BoxFuture<Result<()>> {
         async move {
-            if let Some(scope) = self.files.get(&url) {
-                if scope.version > version {
-                    return Ok(());
-                }
+            if let Entry::Occupied(_) = self.files.entry(url.clone()) {
+                return Ok(());
             }
-            let mut parser = self.parsers.get().await?;
-            let scope = FileInfo::new(version, content, parser.deref_mut(), definitions)?;
-            let mut scope = self.files.entry(url.clone()).insert(scope);
-            self.preprocessor_pass(&url, &mut scope).await;
-            self.client.publish_diagnostics(
-                url.clone(),
-                scope.diagnostics.clone(),
-                Some(scope.version)
-            ).await;
-            Ok(())
+            let content = Self::get_content(url.clone()).await.ok_or(Error::Parse)?;
+            self.on_file_update(url, 0, content).await
         }.boxed()
     }
 
-    async fn preprocessor_pass(&self, url: &Url, scope: &mut FileInfo) {
-        let tree = std::mem::replace(&mut scope.tree, NULL.get().expect("null tree is not initialized").clone());
+    async fn on_file_update(&self, url: Url, version: i32, content: String) -> Result<()> {
+        if let Entry::Occupied(entry) = self.files.entry(url.clone()) {
+            if entry.get().version > version {
+                return Ok(());
+            }
+        }
+        self.on_text_change(url, version, content).await
+    }
+
+    async fn on_text_change(&self, url: Url, version: i32, content: String) -> Result<()> {
+        let tree = self.parse(content.as_bytes()).await?;
+        self.on_tree_change(url, version, content, tree).await
+    }
+
+    async fn on_tree_change(&self, url: Url, version: i32, content: String, tree: Tree) -> Result<()> {
         let mut cursor = tree.walk();
         let mut if_stack = vec![];
         let mut run = true;
+        let mut scope = Scope::new(version, content);
         while run {
-            let traverse = self.preprocessor_directive(url, scope, cursor.node().into(), &mut if_stack).await;
+            let traverse = self.enter_node(&url, &mut scope, cursor.node().into(), &mut if_stack).await;
             match traverse {
                 Err(diagnostic) => scope.diagnostics.push(diagnostic.0),
                 Ok(true) => {
@@ -193,14 +190,24 @@ impl Backend {
         }
         for (_, n_if, n_else) in if_stack {
             scope.diagnostics.push(n_if.error("expected #endif").with(
-                n_else.map(|e| e.related(url, "#else here"))
+                n_else.map(|e| e.related(&url, "#else here"))
             ).0);
         }
         drop(cursor);
-        scope.tree = tree;
+        self.on_semantics_change(url, scope).await
     }
 
-    fn preprocess_expression(&self, url: &Url, scope: &mut FileInfo, node: W<Node>) -> std::result::Result<bool, W<Diagnostic>> {
+    async fn on_semantics_change(&self, url: Url, scope: Scope) -> Result<()> {
+        self.client.publish_diagnostics(
+            url.clone(),
+            scope.diagnostics.clone(),
+            Some(scope.version)
+        ).await;
+        self.files.entry(url).insert(scope);
+        Ok(())
+    }
+
+    fn preprocess_expression(&self, url: &Url, scope: &mut Scope, node: W<Node>) -> std::result::Result<bool, W<Diagnostic>> {
         Ok(match node.kind() {
             "string" => node.is_empty(),
             "decimal" => node
@@ -249,7 +256,7 @@ impl Backend {
         }
     }
 
-    fn find_file(&self, url: &Url, scope: &mut FileInfo, node: W<Node>) -> std::result::Result<Url, W<Diagnostic>> {
+    fn find_file(&self, url: &Url, scope: &mut Scope, node: W<Node>) -> std::result::Result<Url, W<Diagnostic>> {
         let string = node.text(scope.content.as_bytes())?;
         let path = string.get(1..string.len() - 1).ok_or_else(|| node.error("not a string literal"))?;
         Self::test_file("", path)
@@ -258,14 +265,14 @@ impl Backend {
             .ok_or_else(|| node.error("could not fild file"))
     }
 
-    async fn get_content(path: &Url) -> Option<String> {
+    async fn get_content(path: Url) -> Option<String> {
         let mut file = File::open(path.to_file_path().ok()?).await.ok()?;
         let mut result = String::new();
         file.read_to_string(&mut result).await.ok()?;
         Some(result)
     }
 
-    async fn preprocessor_directive<'tree>(&self, url: &Url, scope: &mut FileInfo, node: W<Node<'tree>>, if_stack: &mut IfStack<'tree>) -> std::result::Result<bool, W<Diagnostic>> {
+    async fn enter_node<'tree>(&self, url: &Url, scope: &mut Scope, node: W<Node<'tree>>, if_stack: &mut IfStack<'tree>) -> std::result::Result<bool, W<Diagnostic>> {
         let skip = if_stack.last().map(|(if_condition, _, n_else)| *if_condition != n_else.is_none()).unwrap_or_default();
         match node.kind() {
             "preprocessor_define" => if !skip {
@@ -280,23 +287,12 @@ impl Backend {
             "preprocessor_include" => if !skip {
                 let filename = node.expect("filename")?;
                 let file_url = self.find_file(url, scope, filename)?;
-                match self.files.entry(file_url.clone()) {
-                    Entry::Occupied(entry) => {
-                        if !entry.get().once {
-                            Err(filename.warning("all files included as #once"))?;
-                        }
-                    },
-                    Entry::Vacant(entry) => {
-                        drop(entry); // avoid dashmap entry deadlock
-                        let content = Self::get_content(&file_url).await.ok_or_else(|| filename.error("could not open file"))?;
-                        let _ = self.process_file(file_url.clone(), content, 0, scope.definitions.clone()).await;
-                    },
-                };
+                self.on_file_open(file_url.clone()).await.map_err(|_| filename.error("could not read file"))?;
                 if let Some(file_scope) = self.files.get(&file_url) {
                     scope.definitions = file_scope.definitions.clone();
                 }
                 else {
-                    Err(filename.error("error while processing file"))?;
+                    Err(filename.error(""))?;
                 }
             },
             "preprocessor_once" => if !skip { scope.once = true; },
@@ -419,11 +415,10 @@ impl LanguageServer for Backend {
         if document.language_id != "fastbuild" {
             return;
         }
-        self.process_file(
+        self.on_file_update(
             document.uri,
-            document.text,
             document.version,
-            Definitions::new(),
+            document.text,
         ).await.unwrap();
     }
 
@@ -434,11 +429,10 @@ impl LanguageServer for Backend {
             warn!("file changes: {:?}", params.content_changes);
             return;
         }
-        let _ = self.process_file(
+        let _ = self.on_file_update(
             document.uri,
-            std::mem::take(&mut params.content_changes[0].text),
             document.version,
-            Definitions::new(),
+            std::mem::take(&mut params.content_changes[0].text),
         ).await;
     }
 
