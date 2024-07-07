@@ -15,8 +15,6 @@ use tokio::fs::File;
 
 use std::collections::{HashMap, HashSet};
 use std::env::VarError::NotPresent;
-use std::path::PathBuf;
-
 use parser_pool::ParserPool;
 use tower_lsp::{jsonrpc, lsp_types::*};
 use tower_lsp::{Client, LanguageServer, Server, LspService};
@@ -143,7 +141,7 @@ struct Backend {
     client: Client,
     parsers: ParserPool,
     files: DashMap<Url, Scope>,
-    builtins: HashSet<Url>,
+    builtins: HashMap<Url, String>,
 }
 
 impl Backend {
@@ -153,9 +151,11 @@ impl Backend {
     }
 
     async fn on_file_open(&self, url: Url) -> Result<()> {
-        if let Entry::Occupied(_) = self.files.entry(url.clone()) {
+        let entry = self.files.entry(url.clone());
+        if let Entry::Occupied(_) = entry {
             return Ok(());
         }
+        drop(entry);
         let content = Self::get_content(url.clone()).await.ok_or(Error::Parse)?;
         self.on_file_update(url, 0, content).await
     }
@@ -181,8 +181,8 @@ impl Backend {
         let mut if_stack = vec![];
         let mut run = true;
         let mut scope = Scope::new(version, content);
-        if !self.builtins.contains(&url) {
-            for builtin_url in self.builtins.iter() {
+        if !self.builtins.contains_key(&url) {
+            for (builtin_url, _) in self.builtins.iter() {
                 if let Some(file_scope) = self.files.get(builtin_url) {
                     scope.definitions.extend(file_scope.definitions.clone());
                     scope.references.insert(builtin_url.clone());
@@ -264,7 +264,7 @@ impl Backend {
                 let argument = node.expect("arguments")?;
                 match node.expect("name")?.text(scope.content.as_bytes())? {
                     "exists" => scope.find_env_variable(argument),
-                    "file_exists" => self.find_file(url, scope, argument).and(Ok(())),
+                    "file_exists" => self.find_file(url, scope, argument.expect("double_quoted")?).and(Ok(())),
                     _ => Err(node.error("unknown macro function")),
                 }.and(Ok(true))?
             },
@@ -274,23 +274,24 @@ impl Backend {
         })
     }
 
-    fn test_file(parent: impl Into<PathBuf>, path: &str) -> Option<Url> {
-        let path = parent.into().join(path);
-        if path.exists() {
-            Url::from_file_path(path).ok()
+    fn search_file(&self, url: &Url, path: &str) -> Option<Url> {
+        if url.scheme() == "file" {
+            if let Ok(current) = std::env::current_dir() {
+                if let Ok(path) = Url::from_file_path(current.parent()?.join(path)) {
+                    return Some(path);
+                }
+            }
         }
-        else {
-            None
-        }
+
+        //let mut url = url.clone();
+        //let dir = url.to_file_path().ok()?;
+        //url.set_path(dir.parent()?.to_str()?);
+        url.join(path).ok()
     }
 
     fn find_file(&self, url: &Url, scope: &mut Scope, node: W<Node>) -> std::result::Result<Url, W<Diagnostic>> {
-        let string = node.text(scope.content.as_bytes())?;
-        let path = string.get(1..string.len() - 1).ok_or_else(|| node.error("not a string literal"))?;
-        Self::test_file("", path)
-            .or_else(|| std::env::current_dir().ok().and_then(|parent| Self::test_file(parent, path)))
-            .or_else(|| url.to_file_path().ok().and_then(|x| x.parent().map(|y| y.to_owned())).and_then(|parent| Self::test_file(parent, path)))
-            .ok_or_else(|| node.error("could not fild file"))
+        let path = node.text(scope.content.as_bytes())?;
+        self.search_file(url, path).ok_or_else(|| node.error("could not find file"))
     }
 
     async fn get_content(path: Url) -> Option<String> {
@@ -313,7 +314,7 @@ impl Backend {
                 scope.undefine(url, node.expect("variable")?)?;
             },
             "preprocessor_include" => if !skip {
-                let filename = node.expect("filename")?;
+                let filename = node.expect("filename")?.expect("double_quoted")?;
                 let file_url = self.find_file(url, scope, filename)?;
                 self.on_file_open(file_url.clone()).await.map_err(|_| filename.error("could not read file"))?;
                 if let Some(file_scope) = self.files.get(&file_url) {
@@ -381,16 +382,14 @@ impl Backend {
     }
 
     fn new(client: Client) -> Result<Self> {
-        let builtin_dir = PathBuf::from("/home/pinbraerts/src/fastbuild-lsp/builtins");
-        if !builtin_dir.exists() {
-            Err(Error::FileNotFound)?;
-        }
-        let platform = format!("{}.bff", std::env::consts::OS);
-        let builtin_files = [
-            "aliases.bff",
-            &platform,
-        ];
-        let builtins = builtin_files.iter().filter_map(|f| Url::from_file_path(builtin_dir.join(f)).ok()).collect();
+        let mut builtins = HashMap::new();
+        builtins.insert(Url::parse("memory:///builtins/alias.bff")?, include_str!("../builtins/alias.bff").into());
+        match std::env::consts::OS {
+            "linux" => builtins.insert(Url::parse("memory:///builtins/linux.bff")?, include_str!("../builtins/linux.bff").into()),
+            "windows" => builtins.insert(Url::parse("memory:///builtins/windows.bff")?, include_str!("../builtins/windows.bff").into()),
+            "macos" => builtins.insert(Url::parse("memory:///builtins/macos.bff")?, include_str!("../builtins/macos.bff").into()),
+            _ => None,
+        };
         let language = tree_sitter_fastbuild::language();
         let mut parser = Parser::new();
         parser.set_language(&language)?;
@@ -407,8 +406,8 @@ impl Backend {
 impl LanguageServer for Backend {
 
     async fn initialize(&self, _: InitializeParams) -> jsonrpc::Result<InitializeResult> {
-        for url in self.builtins.iter() {
-            let _ = self.on_file_open(url.clone()).await;
+        for (url, content) in self.builtins.iter() {
+            let _ = self.on_file_update(url.clone(), 0, content.clone()).await;
         }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -551,7 +550,7 @@ mod tests {
 
     #[tokio::test]
     async fn syntax_error() {
-        let (uri, service) = make_with_file("memory://syntax_error.bff", ".A =").await;
+        let (uri, service) = make_with_file("memory:///syntax_error.bff", ".A =").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
@@ -560,7 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn redefinition() {
-        let (uri, service) = make_with_file("memory://redefinition.bff", "#define A\n#define A").await;
+        let (uri, service) = make_with_file("memory:///redefinition.bff", "#define A\n#define A").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
@@ -575,7 +574,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_not_found() {
-        let (uri, service) = make_with_file("memory://import_not_found.bff", "#import __SURELYNOSUCHENVVAR").await;
+        let (uri, service) = make_with_file("memory:///import_not_found.bff", "#import __SURELYNOSUCHENVVAR").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
@@ -588,7 +587,7 @@ mod tests {
 
     #[tokio::test]
     async fn undef() {
-        let (uri, service) = make_with_file("memory://undefine.bff", "#define A\n#undef A").await;
+        let (uri, service) = make_with_file("memory:///undefine.bff", "#define A\n#undef A").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         assert_eq!(scope.diagnostics, vec!());
@@ -596,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn undef_undefined() {
-        let (uri, service) = make_with_file("memory://undefined.bff", "#undef A").await;
+        let (uri, service) = make_with_file("memory:///undefined.bff", "#undef A").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
@@ -609,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn import() {
-        let (uri, service) = make_with_file("memory://import.bff", "#import PATH").await;
+        let (uri, service) = make_with_file("memory:///import.bff", "#import PATH").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         assert_eq!(scope.diagnostics, vec!());
@@ -617,7 +616,7 @@ mod tests {
 
     #[tokio::test]
     async fn once() {
-        let (uri, service) = make_with_file("memory://once.bff", "#once").await;
+        let (uri, service) = make_with_file("memory:///once.bff", "#once").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         assert!(scope.once);
@@ -625,7 +624,7 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_if() {
-        let (uri, service) = make_with_file("memory://preprocessor_if.bff", "#if 1\n.A = 3\n#else\n.B = 4\n#endif").await;
+        let (uri, service) = make_with_file("memory:///preprocessor_if.bff", "#if 1\n.A = 3\n#else\n.B = 4\n#endif").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let token = scope.semantic_tokens.first().expect("no semantic tokens");
@@ -638,7 +637,7 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_else() {
-        let (uri, service) = make_with_file("memory://preprocessor_else.bff", "#if 0\n.A = 3\n#else\n.B = 4\n#endif").await;
+        let (uri, service) = make_with_file("memory:///preprocessor_else.bff", "#if 0\n.A = 3\n#else\n.B = 4\n#endif").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let token = scope.semantic_tokens.first().expect("no semantic tokens");
@@ -651,7 +650,7 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_if_evaluation() {
-        let (uri, service) = make_with_file("memory://preprocessor_if_missing.bff", "#define A\n#if 1\n#undef A\n\n#endif\n#if A\n.A = 3\n#endif").await;
+        let (uri, service) = make_with_file("memory:///preprocessor_if_missing.bff", "#define A\n#if 1\n#undef A\n\n#endif\n#if A\n.A = 3\n#endif").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let token = scope.semantic_tokens.first().expect("no semantic tokens");
@@ -665,7 +664,7 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_if_missing() {
-        let (uri, service) = make_with_file("memory://preprocessor_if_missing.bff", "#else").await;
+        let (uri, service) = make_with_file("memory:///preprocessor_if_missing.bff", "#else").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
@@ -678,7 +677,7 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_endif_missing() {
-        let (uri, service) = make_with_file("memory://preprocessor_if_missing.bff", "#if 1").await;
+        let (uri, service) = make_with_file("memory:///preprocessor_if_missing.bff", "#if 1").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
@@ -691,7 +690,7 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_unknown() {
-        let (uri, service) = make_with_file("memory://preprocessor_unknown.bff", "#unknown").await;
+        let (uri, service) = make_with_file("memory:///preprocessor_unknown.bff", "#unknown").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
@@ -704,7 +703,7 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_include() {
-        let (uri, service) = make_with_file("file:///home/pinbraerts/src/fastbuild-lsp/builtins/preprocessor_include.bff", "#include \"alias.bff\"").await;
+        let (uri, service) = make_with_file("memory:///builtins/preprocessor_include.bff", "#include \"alias.bff\"").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         assert_eq!(scope.diagnostics, vec![]);
@@ -712,15 +711,22 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_if_file_exists() {
-        let (uri, service) = make_with_file("file:///home/pinbraerts/src/fastbuild-lsp/builtins/preprocessor_if_file_exists.bff", "#if file_exists(\"../src/main.rs\")\n#endif").await;
+        let (uri, service) = make_with_file("memory:///builtins/preprocessor_if_file_exists.bff", "#if file_exists(\"alias.bff\")\n#else\n.A = 3\n#endif").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         assert_eq!(scope.diagnostics, vec![]);
+        assert_eq!(scope.semantic_tokens.first(), Some(&SemanticToken {
+            delta_line: 2,
+            delta_start: 0,
+            length: u32::max_value(),
+            token_type: 0,
+            token_modifiers_bitset: 0,
+        }));
     }
 
     #[tokio::test]
     async fn os() {
-        let (uri, service) = make_with_file("memory://os.bff", "").await;
+        let (uri, service) = make_with_file("memory:///os.bff", "").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         match std::env::consts::OS {
