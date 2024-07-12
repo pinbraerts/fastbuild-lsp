@@ -440,13 +440,8 @@ impl Backend {
         };
         let word = match node.kind() {
             "identifier" => Ok(node),
-            "string" => node.expect("double_quoted"),
-            "interpolation" | "preprocessor_define" | "preprocessor_undef" | "preprocessor_import"
-                => node.expect("variable"),
-            "preprocessor_include"
-                => node.expect("filename").ok()?.expect("double_quoted"),
-            "preprocessor_call" | "function_call" | "function_definition"
-                => node.expect("name"),
+            "interpolation" => node.expect("variable"),
+            "function_call" | "function_definition" => node.expect("name"),
             "usage" => node.expect("variable"),
             "placeholder" => node.expect("argument"),
             _ => Err(Diagnostic::default()),
@@ -971,18 +966,16 @@ mod tests {
         let scope = backend.files.get(&uri).expect("no file");
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
-        for i in 0..8 {
-            let hover = backend.hover(HoverParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier::new(uri.clone()),
-                    position: Position::new(2, i),
-                },
-                work_done_progress_params: WorkDoneProgressParams {
-                    work_done_token: None,
-                },
-            }).await.expect("no hover").expect("no hover");
-            assert_eq!(hover, hover_markdown("documentation\nfor A\n"));
-        }
+        let hover = backend.hover(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier::new(uri.clone()),
+                position: Position::new(2, 8),
+            },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        }).await.expect("no hover").expect("no hover");
+        assert_eq!(hover, hover_markdown("documentation\nfor A\n"));
     }
 
     #[tokio::test]
