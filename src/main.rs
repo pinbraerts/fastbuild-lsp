@@ -156,7 +156,7 @@ impl Backend {
             return Ok(());
         }
         drop(entry);
-        let content = Self::get_content(url.clone()).await.ok_or(Error::Parse)?;
+        let content = self.get_content(url.clone()).await.ok_or(Error::Parse)?;
         self.on_file_update(url, 0, content).await
     }
 
@@ -171,12 +171,14 @@ impl Backend {
 
     fn on_text_change(&self, url: Url, version: i32, content: String) -> BoxFuture<Result<()>> {
         async move {
+            self.client.log_message(MessageType::LOG, format!("parsing {}", url)).await;
             let tree = self.parse(content.as_bytes()).await?;
             self.on_tree_change(url, version, content, tree).await
         }.boxed()
     }
 
     async fn on_tree_change(&self, url: Url, version: i32, content: String, tree: Tree) -> Result<()> {
+        self.client.log_message(MessageType::LOG, format!("analysing {}", url)).await;
         let mut cursor = tree.walk();
         let mut if_stack = vec![];
         let mut run = true;
@@ -217,6 +219,7 @@ impl Backend {
     }
 
     async fn on_semantics_change(&self, url: Url, scope: Scope) -> Result<()> {
+        self.client.log_message(MessageType::LOG, format!("updating diagnostics {}", url)).await;
         self.client.publish_diagnostics(
             url.clone(),
             scope.diagnostics.clone(),
@@ -226,12 +229,14 @@ impl Backend {
         let references: Vec<Url> = self.files.iter().filter_map(|v| if v.value().references.contains(&url) { Some(v.key().clone()) } else { None }).collect();
         let should_refresh = !references.is_empty();
         let items: Vec<(Url, Scope)> = references.into_iter().filter_map(|v| self.files.remove(&v)).collect();
+        self.client.log_message(MessageType::LOG, format!("updating dependants {}", url)).await;
         let _ = join_all(
             items
                 .into_iter()
                 .map(|(reference, scope)| self.on_text_change(reference, scope.version, scope.content))
         ).await;
         if should_refresh {
+            self.client.log_message(MessageType::LOG, format!("refreshing semantic tokens {}", url)).await;
             self.client.semantic_tokens_refresh().await?;
         }
         Ok(())
@@ -294,7 +299,8 @@ impl Backend {
         self.search_file(url, path).ok_or_else(|| node.error("could not find file"))
     }
 
-    async fn get_content(path: Url) -> Option<String> {
+    async fn get_content(&self, path: Url) -> Option<String> {
+        self.client.log_message(MessageType::LOG, format!("reading {}", path)).await;
         let mut file = File::open(path.to_file_path().ok()?).await.ok()?;
         let mut result = String::new();
         file.read_to_string(&mut result).await.ok()?;
