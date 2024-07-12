@@ -114,18 +114,29 @@ struct Scope {
 
 type IfStack<'tree> = Vec<(bool, W<Node<'tree>>, Option<W<Node<'tree>>>)>;
 
+impl Default for Scope {
+    fn default() -> Self {
+        Self {
+            version: Default::default(),
+            diagnostics: Default::default(),
+            definitions: Default::default(),
+            semantic_tokens: Default::default(),
+            once: Default::default(),
+            content: Default::default(),
+            references: Default::default(),
+            tree: NULL.get().unwrap().clone(),
+        }
+    }
+}
+
 impl Scope {
 
     fn new(version: i32, content: String) -> Self {
         Scope {
             version,
             content,
-            diagnostics: Default::default(),
-            definitions: Default::default(),
-            semantic_tokens: Default::default(),
-            references: Default::default(),
-            once: false,
             tree: NULL.get().unwrap().clone(),
+            ..Default::default()
         }
     }
 
