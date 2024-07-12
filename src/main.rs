@@ -35,11 +35,12 @@ enum Reference {
 struct Symbol {
     value: bool,
     references: Vec<(Location, Reference)>,
+    documentation: String,
 }
 
 impl Symbol {
 
-    fn define(&mut self, url: &Url, node: W<Node>) -> std::result::Result<(), W<Diagnostic>> {
+    fn define(&mut self, url: &Url, node: W<Node>, documentation: String) -> std::result::Result<(), W<Diagnostic>> {
         match self.references.last() {
             Some((location, Reference::Define)) => Err(node.error(
                 "macro redefinition"
@@ -49,6 +50,7 @@ impl Symbol {
             }]))),
             _ => {
                 self.value = true;
+                self.documentation = documentation;
                 self.references.push((node.url(url), Reference::Define));
                 Ok(())
             },
@@ -112,9 +114,9 @@ impl Scope {
         Scope { version, content, ..Default::default() }
     }
 
-    fn define(&mut self, url: &Url, node: W<Node>) -> std::result::Result<(), W<Diagnostic>> {
+    fn define(&mut self, url: &Url, node: W<Node>, documentation: String) -> std::result::Result<(), W<Diagnostic>> {
         let name = node.text(self.content.as_bytes())?;
-        self.definitions.entry(name.into()).or_default().define(url, node)
+        self.definitions.entry(name.into()).or_default().define(url, node, documentation)
     }
 
     fn undefine(&mut self, url: &Url, node: W<Node>) -> std::result::Result<(), W<Diagnostic>> {
@@ -191,8 +193,9 @@ impl Backend {
                 }
             }
         }
+        let mut documentation = String::new();
         while run {
-            let traverse = self.enter_node(&url, &mut scope, cursor.node().into(), &mut if_stack).await;
+            let traverse = self.enter_node(&url, &mut scope, cursor.node().into(), &mut if_stack, &mut documentation).await;
             match traverse {
                 Err(diagnostic) => scope.diagnostics.push(diagnostic.0),
                 Ok(true) => {
@@ -307,11 +310,15 @@ impl Backend {
         Some(result)
     }
 
-    async fn enter_node<'tree>(&self, url: &Url, scope: &mut Scope, node: W<Node<'tree>>, if_stack: &mut IfStack<'tree>) -> std::result::Result<bool, W<Diagnostic>> {
+    async fn enter_node<'tree>(&self, url: &Url, scope: &mut Scope, node: W<Node<'tree>>, if_stack: &mut IfStack<'tree>, documentation: &mut String) -> std::result::Result<bool, W<Diagnostic>> {
         let skip = if_stack.last().map(|(if_condition, _, n_else)| *if_condition != n_else.is_none()).unwrap_or_default();
+        if !node.is_named() {
+            return Ok(false);
+        }
+        let mut traverse = false;
         match node.kind() {
             "preprocessor_define" => if !skip {
-                scope.define(url, node.expect("variable")?)?;
+                scope.define(url, node.expect("variable")?, documentation.clone())?;
             },
             "preprocessor_import" => if !skip {
                 scope.find_env_variable(node.expect("variable")?)?;
@@ -380,11 +387,18 @@ impl Backend {
                 }
                 if_stack.pop();
             },
+            "comment" => {
+                let text = node.text(scope.content.as_bytes())?;
+                *documentation += text.get(2..).unwrap_or_default();
+                documentation.push('\n');
+                return Ok(false);
+            },
             _ => {
-                return Ok(true);
+                traverse = true;
             },
         }
-        Ok(false)
+        documentation.clear();
+        Ok(traverse)
     }
 
     fn new(client: Client) -> Result<Self> {
@@ -796,6 +810,17 @@ mod tests {
                 }]);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn define_with_documentation() {
+        let (uri, service) = make_with_file("memory:///define_with_documentation.bff", "; documentation\n; for A\n#define A").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.diagnostics, Vec::new());
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        let definition = scope.definitions.get("A").expect("undefined");
+        assert_eq!(definition.documentation, "documentation\nfor A\n");
     }
 
 }
