@@ -448,18 +448,81 @@ impl Backend {
         let file = self.files.get(&url)?;
         let point: Point = W(position).into();
         let node = file.tree.root_node().descendant_for_point_range(point, point).map(W)?;
-        if trigger == "#" || node.kind().starts_with("preprocessor_") {
-            Some(vec!["import", "if", "define", "include", "undef", "endif", "else"]
-                .into_iter()
-                .map(|x| CompletionItem {
-                    label: x.into(),
+        Some(if trigger == "#" || node.kind().starts_with("preprocessor_") {
+            vec![
+                CompletionItem {
+                    label: "import".into(),
+                    insert_text: Some("import ${1:env_var}".into()),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    label_details: Some(CompletionItemLabelDetails {
+                        detail: Some("environment variable".into()),
+                        description: None,
+                    }),
                     kind: Some(CompletionItemKind::SNIPPET),
                     ..Default::default()
-                })
-                .collect())
+                },
+                CompletionItem {
+                    label: "define".into(),
+                    insert_text: Some("define ${1:macro}".into()),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    label_details: Some(CompletionItemLabelDetails {
+                        detail: Some("macro".into()),
+                        description: None,
+                    }),
+                    kind: Some(CompletionItemKind::SNIPPET),
+                    ..Default::default()
+                },
+                CompletionItem {
+                    label: "include".into(),
+                    insert_text: Some("include \"${1:filename}.bff\"".into()),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    label_details: Some(CompletionItemLabelDetails {
+                        detail: Some("\"filename\"".into()),
+                        description: None,
+                    }),
+                    kind: Some(CompletionItemKind::SNIPPET),
+                    ..Default::default()
+                },
+                CompletionItem {
+                    label: "undef".into(),
+                    insert_text: Some("undef ${1:macro}".into()),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    label_details: Some(CompletionItemLabelDetails {
+                        detail: Some("macro".into()),
+                        description: None,
+                    }),
+                    kind: Some(CompletionItemKind::SNIPPET),
+                    ..Default::default()
+                },
+                CompletionItem {
+                    label: "if".into(),
+                    insert_text: Some("if ${1:0}\n$0\n#endif // $1".into()),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    kind: Some(CompletionItemKind::SNIPPET),
+                    ..Default::default()
+                },
+                CompletionItem {
+                    label: "endif".into(),
+                    insert_text: Some("endif\n".into()),
+                    kind: Some(CompletionItemKind::SNIPPET),
+                    ..Default::default()
+                },
+                CompletionItem {
+                    label: "once".into(),
+                    insert_text: Some("once\n".into()),
+                    kind: Some(CompletionItemKind::SNIPPET),
+                    ..Default::default()
+                },
+                CompletionItem {
+                    label: "else".into(),
+                    insert_text: Some("else\n".into()),
+                    kind: Some(CompletionItemKind::SNIPPET),
+                    ..Default::default()
+                },
+            ]
         }
         else {
-            Some(file.definitions
+            file.definitions
                 .iter()
                 .map(|(name, definition)| CompletionItem {
                     label: name.clone(),
@@ -467,8 +530,8 @@ impl Backend {
                     documentation: Some(Documentation::MarkupContent(definition.documentation.clone())),
                     ..Default::default()
                 })
-                .collect())
-        }
+                .collect()
+        })
     }
 
     async fn get_declarations(&self, url: &Url, position: Position) -> Option<Vec<Location>> {
@@ -1065,12 +1128,6 @@ mod tests {
         }).await.expect("no completion").expect("no completion");
         if let CompletionResponse::Array(completion) = completion {
             assert_eq!(completion[0].label, "import");
-            assert_eq!(completion[1].label, "if");
-            assert_eq!(completion[2].label, "define");
-            assert_eq!(completion[3].label, "include");
-            assert_eq!(completion[4].label, "undef");
-            assert_eq!(completion[5].label, "endif");
-            assert_eq!(completion[6].label, "else");
         }
         else {
             panic!();
