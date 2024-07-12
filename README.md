@@ -4,12 +4,14 @@ A language server for [FASTBuild](https://fastbuild.org)
 
 ## Features
 
+Currently all features work only for macros
+
 - [x] Syntax checking
 - [x] Diagnostics
-- [x] Semantic tokens (only for faulty `#if` branches)
-- [x] Hover (only for macros)
-- [x] Autocompletion (only for macros)
-- [ ] Go to definition
+- [x] Semantic tokens
+- [x] Hover
+- [x] Autocompletion
+- [x] Go to definition
 - [ ] Rename
 - [ ] Find references
 - [ ] Dynamic type checking

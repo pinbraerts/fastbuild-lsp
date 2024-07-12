@@ -7,9 +7,9 @@ use dashmap::DashMap;
 use futures::future::{join_all, BoxFuture};
 use futures::FutureExt;
 use helpers::W;
+use request::{GotoDeclarationParams, GotoDeclarationResponse};
 use tokio::io::AsyncReadExt;
 use tokio::sync::OnceCell;
-use tower_lsp::lsp_types::Documentation;
 use tree_sitter::{Node, Parser, Point, Tree};
 
 use tokio::fs::File;
@@ -477,6 +477,42 @@ impl Backend {
         }
     }
 
+    async fn get_declarations(&self, url: &Url, position: Position) -> Option<Vec<Location>> {
+        let file = self.files.get(url)?;
+        let point = W(position).into();
+        let node = file.tree.root_node().descendant_for_point_range(point, point).map(W)?;
+        let node = if !node.is_named() {
+            if node.kind() == "#" {
+                node.next_named_sibling()
+            }
+            else {
+                node.parent().or_else(|| node.next_named_sibling())
+            }.map(W)?
+        }
+        else {
+            node
+        };
+        let word = match node.kind() {
+            "identifier" => Ok(node),
+            "string" => node.expect("double_quoted"),
+            "interpolation" | "preprocessor_define" | "preprocessor_undef" | "preprocessor_import"
+                => node.expect("variable"),
+            "preprocessor_include"
+                => node.expect("filename").ok()?.expect("double_quoted"),
+            "preprocessor_call" | "function_call" | "function_definition"
+                => node.expect("name"),
+            "usage" => node.expect("variable"),
+            "placeholder" => node.expect("argument"),
+            _ => Err(Diagnostic::default()),
+        }.ok()?.text(file.content.as_bytes()).ok()?;
+        let symbol = file.definitions.get(word)?;
+        Some(symbol.references
+            .iter()
+            .filter_map(|(location, kind)| if *kind == Reference::Define { Some(location.clone()) } else { None })
+            .collect()
+        )
+    }
+
     fn new(client: Client) -> Result<Self> {
         let mut builtins = HashMap::new();
         builtins.insert(Url::parse("memory:///builtins/alias.bff")?, include_str!("../builtins/alias.bff").into());
@@ -519,8 +555,8 @@ impl LanguageServer for Backend {
         }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                // declaration_provider: Some(DeclarationCapability::Simple(true)),
-                // definition_provider: Some(OneOf::Left(true)),
+                declaration_provider: Some(DeclarationCapability::Simple(true)),
+                definition_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec!["#"].into_iter().map(|x| x.to_owned()).collect()),
                     ..Default::default()
@@ -641,6 +677,17 @@ impl LanguageServer for Backend {
             .await
             .map(CompletionResponse::Array)
         )
+    }
+
+    async fn goto_declaration(&self, params: GotoDeclarationParams) -> jsonrpc::Result<Option<GotoDeclarationResponse>> {
+        trace!("textDocument/gotoDeclaration");
+        let pos = params.text_document_position_params;
+        Ok(self.get_declarations(&pos.text_document.uri, pos.position).await
+            .map(GotoDeclarationResponse::Array))
+    }
+
+    async fn goto_definition(&self, params: GotoDefinitionParams) -> jsonrpc::Result<Option<GotoDefinitionResponse>> {
+        self.goto_declaration(params).await
     }
 
 }
@@ -1032,6 +1079,52 @@ mod tests {
                 "macos" => "__OSX__",
                 _ => panic!("wrong os"),
             });
+        }
+        else {
+            panic!("wrong completion type")
+        }
+    }
+
+    #[tokio::test]
+    async fn goto_declaration() {
+        let (uri, service) = make_with_file("memory:///goto_declaration.bff", "#define A\n#if A\n#endif").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        assert_eq!(scope.diagnostics, Vec::new());
+        let declatations = backend.goto_declaration(GotoDeclarationParams {
+            text_document_position_params: TextDocumentPositionParams::new(TextDocumentIdentifier::new(uri.clone()), Position::new(1, 4)),
+            work_done_progress_params: WorkDoneProgressParams { work_done_token: None },
+            partial_result_params: PartialResultParams { partial_result_token: None },
+        }).await.expect("no completion").expect("no completion");
+        if let GotoDefinitionResponse::Array(declarations) = declatations {
+            let declaration = declarations.first().expect("no declatations");
+            assert_eq!(declaration.uri, uri);
+            assert_eq!(declaration.range.start, Position::new(0, 8));
+            assert_eq!(declaration.range.end, Position::new(0, 9));
+        }
+        else {
+            panic!("wrong completion type")
+        }
+    }
+
+    #[tokio::test]
+    async fn goto_definition() {
+        let (uri, service) = make_with_file("memory:///goto_definition.bff", "#define A\n#if A\n#endif").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        assert_eq!(scope.diagnostics, Vec::new());
+        let declatations = backend.goto_definition(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams::new(TextDocumentIdentifier::new(uri.clone()), Position::new(1, 4)),
+            work_done_progress_params: WorkDoneProgressParams { work_done_token: None },
+            partial_result_params: PartialResultParams { partial_result_token: None },
+        }).await.expect("no completion").expect("no completion");
+        if let GotoDefinitionResponse::Array(definitions) = declatations {
+            let definition = definitions.first().expect("no declatations");
+            assert_eq!(definition.uri, uri);
+            assert_eq!(definition.range.start, Position::new(0, 8));
+            assert_eq!(definition.range.end, Position::new(0, 9));
         }
         else {
             panic!("wrong completion type")
