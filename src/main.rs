@@ -295,7 +295,7 @@ impl Backend {
                 ||
                 self.preprocess_expression(url, scope, node.expect("right")?)?
             },
-            "function_call" => {
+            "call" => {
                 let argument = node.expect("arguments")?;
                 match node.expect("name")?.text(scope.content.as_bytes())? {
                     "exists" => scope.find_env_variable(argument),
@@ -344,16 +344,16 @@ impl Backend {
         }
         let mut traverse = false;
         match node.kind() {
-            "preprocessor_define" => if !skip {
+            "define" => if !skip {
                 scope.define(url, node.expect("variable")?, documentation.clone())?;
             },
-            "preprocessor_import" => if !skip {
+            "import" => if !skip {
                 scope.find_env_variable(node.expect("variable")?)?;
             },
-            "preprocessor_undef" => if !skip {
+            "undef" => if !skip {
                 scope.undefine(url, node.expect("variable")?)?;
             },
-            "preprocessor_include" => if !skip {
+            "include" => if !skip {
                 let filename = node.expect("filename")?.expect("double_quoted")?;
                 let file_url = self.find_file(url, scope, filename)?;
                 self.on_file_open(file_url.clone()).await.map_err(|_| filename.error("could not read file"))?;
@@ -365,10 +365,10 @@ impl Backend {
                 }
                 scope.references.insert(file_url.clone());
             },
-            "preprocessor_once" => if !skip { scope.once = true; },
-            "preprocessor_unknown" => if !skip { Err(node.error("unknown directive"))? },
+            "once" => if !skip { scope.once = true; },
+            "unknown" => if !skip { Err(node.error("unknown directive"))? },
             "ERROR" => if !skip { Err(node.error("syntax"))? },
-            "preprocessor_if" => {
+            "if" => {
                 let condition = node.expect("condition")?;
                 let result = match self.preprocess_expression(url, scope, condition) {
                     Ok(result) => result,
@@ -379,7 +379,7 @@ impl Backend {
                 };
                 if_stack.push((result, node, None));
             },
-            "preprocessor_else" => {
+            "else" => {
                 match if_stack.last() {
                     Some((_, _, None)) => {
                         if let Some(last) = if_stack.last_mut() {
@@ -394,7 +394,7 @@ impl Backend {
                     None => Err(node.error("expected #if"))?,
                 }
             },
-            "preprocessor_endif" => {
+            "endif" => {
                 let last = if_stack.last().ok_or_else(|| node.error("expected #if"))?;
                 if let Some((start, end)) = match last {
                     (true, _, None) => None,
@@ -446,7 +446,7 @@ impl Backend {
         let word = match node.kind() {
             "identifier" => Ok(node),
             "interpolation" => node.expect("variable"),
-            "function_call" | "function_definition" => node.expect("name"),
+            "call" | "function_definition" => node.expect("name"),
             "usage" => node.expect("variable"),
             "placeholder" => node.expect("argument"),
             _ => Err(Diagnostic::default()),
@@ -459,7 +459,7 @@ impl Backend {
         let file = self.files.get(&url)?;
         let point: Point = W(position).into();
         let node = file.tree.root_node().descendant_for_point_range(point, point).map(W)?;
-        Some(if trigger == "#" || node.kind().starts_with("preprocessor_") {
+        Some(if trigger == "#" || ["undef", "define", "import", "include", "once", "else", "endif", "undef", "unknown"].contains(&node.kind()) {
             vec![
                 CompletionItem {
                     label: "import".into(),
@@ -563,11 +563,11 @@ impl Backend {
         let word = match node.kind() {
             "identifier" => Ok(node),
             "string" => node.expect("double_quoted"),
-            "interpolation" | "preprocessor_define" | "preprocessor_undef" | "preprocessor_import"
+            "interpolation" | "define" | "undef" | "import"
                 => node.expect("variable"),
-            "preprocessor_include"
+            "include"
                 => node.expect("filename").ok()?.expect("double_quoted"),
-            "preprocessor_call" | "function_call" | "function_definition"
+            "call" | "function_definition"
                 => node.expect("name"),
             "usage" => node.expect("variable"),
             "placeholder" => node.expect("argument"),
@@ -584,7 +584,7 @@ impl Backend {
         let word = match node.kind() {
             "identifier" => Ok(node),
             "interpolation" => node.expect("variable"),
-            "function_call" | "function_definition" => node.expect("name"),
+            "call" | "function_definition" => node.expect("name"),
             "usage" => node.expect("variable"),
             "placeholder" => node.expect("argument"),
             _ => Err(Diagnostic::default()),
