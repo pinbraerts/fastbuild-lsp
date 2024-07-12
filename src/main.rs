@@ -20,7 +20,7 @@ use tower_lsp::{jsonrpc, lsp_types::*};
 use tower_lsp::{Client, LanguageServer, Server, LspService};
 use error::{Result, Error};
 
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 
 use crate::parser_pool::new_pool;
 
@@ -95,7 +95,7 @@ impl Symbol {
 static NULL: OnceCell<Tree> = OnceCell::const_new();
 type Definitions = HashMap<String, Symbol>;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Scope {
     version: i32,
     diagnostics: Vec<Diagnostic>,
@@ -104,6 +104,7 @@ struct Scope {
     once: bool,
     content: String,
     references: HashSet<Url>,
+    tree: Tree,
 }
 
 type IfStack<'tree> = Vec<(bool, W<Node<'tree>>, Option<W<Node<'tree>>>)>;
@@ -111,7 +112,16 @@ type IfStack<'tree> = Vec<(bool, W<Node<'tree>>, Option<W<Node<'tree>>>)>;
 impl Scope {
 
     fn new(version: i32, content: String) -> Self {
-        Scope { version, content, ..Default::default() }
+        Scope {
+            version,
+            content,
+            diagnostics: Default::default(),
+            definitions: Default::default(),
+            semantic_tokens: Default::default(),
+            references: Default::default(),
+            once: false,
+            tree: NULL.get().unwrap().clone(),
+        }
     }
 
     fn define(&mut self, url: &Url, node: W<Node>, documentation: String) -> std::result::Result<(), W<Diagnostic>> {
@@ -218,6 +228,7 @@ impl Backend {
             ).0);
         }
         drop(cursor);
+        scope.tree = tree;
         self.on_semantics_change(url, scope).await
     }
 
@@ -401,6 +412,38 @@ impl Backend {
         Ok(traverse)
     }
 
+    async fn find_documentation(&self, url: &Url, position: Position) -> Option<String> {
+        let file = self.files.get(url)?;
+        let point = W(position).into();
+        let node = file.tree.root_node().descendant_for_point_range(point, point).map(W)?;
+        let node = if !node.is_named() {
+            if node.kind() == "#" {
+                node.next_named_sibling()
+            }
+            else {
+                node.parent().or_else(|| node.next_named_sibling())
+            }.map(W)?
+        }
+        else {
+            node
+        };
+        let word = match node.kind() {
+            "identifier" => Ok(node),
+            "string" => node.expect("double_quoted"),
+            "interpolation" | "preprocessor_define" | "preprocessor_undef" | "preprocessor_import"
+                => node.expect("variable"),
+            "preprocessor_include"
+                => node.expect("filename").ok()?.expect("double_quoted"),
+            "preprocessor_call" | "function_call" | "function_definition"
+                => node.expect("name"),
+            "usage" => node.expect("variable"),
+            "placeholder" => node.expect("argument"),
+            _ => Err(Diagnostic::default()),
+        }.ok()?.text(file.content.as_bytes()).ok()?;
+        let symbol = file.definitions.get(word)?;
+        Some(symbol.documentation.clone())
+    }
+
     fn new(client: Client) -> Result<Self> {
         let mut builtins = HashMap::new();
         builtins.insert(Url::parse("memory:///builtins/alias.bff")?, include_str!("../builtins/alias.bff").into());
@@ -422,6 +465,17 @@ impl Backend {
 
 }
 
+pub fn markdown(value: impl Into<String>) -> MarkupContent {
+    MarkupContent { kind: MarkupKind::Markdown, value: value.into() }
+}
+
+pub fn hover_markdown(value: impl Into<String>) -> Hover {
+    Hover {
+        contents: HoverContents::Markup(markdown(value)),
+        range: None,
+    }
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
 
@@ -433,7 +487,7 @@ impl LanguageServer for Backend {
             capabilities: ServerCapabilities {
                 // declaration_provider: Some(DeclarationCapability::Simple(true)),
                 // definition_provider: Some(OneOf::Left(true)),
-                // hover_provider: Some(HoverProviderCapability::Simple(true)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
@@ -526,6 +580,13 @@ impl LanguageServer for Backend {
     //         }))
     //     )
     // }
+
+    async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {
+        trace!("textDocument/hover request");
+        let document = params.text_document_position_params;
+        let documentation = self.find_documentation(&document.text_document.uri, document.position).await;
+        Ok(documentation.and_then(|s| if s.is_empty() { None } else { Some(s) }).map(hover_markdown))
+    }
 
 }
 
@@ -841,6 +902,27 @@ mod tests {
         assert_eq!(scope.semantic_tokens, Vec::new());
         let definition = scope.definitions.get("A").expect("undefined");
         assert_eq!(definition.documentation, "documentation\nfor A\n");
+    }
+
+    #[tokio::test]
+    async fn hover() {
+        let (uri, service) = make_with_file("memory:///hover.bff", "; documentation\n; for A\n#define A").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.diagnostics, Vec::new());
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        for i in 0..8 {
+            let hover = backend.hover(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier::new(uri.clone()),
+                    position: Position::new(2, i),
+                },
+                work_done_progress_params: WorkDoneProgressParams {
+                    work_done_token: None,
+                },
+            }).await.expect("no hover").expect("no hover");
+            assert_eq!(hover, hover_markdown("documentation\nfor A\n"));
+        }
     }
 
 }
