@@ -31,11 +31,21 @@ enum Reference {
     Ref,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct Symbol {
     value: bool,
     references: Vec<(Location, Reference)>,
-    documentation: String,
+    documentation: MarkupContent,
+}
+
+impl Default for Symbol {
+    fn default() -> Self {
+        Self {
+            value: false,
+            references: Vec::new(),
+            documentation: markdown(""),
+        }
+    }
 }
 
 impl Symbol {
@@ -50,7 +60,7 @@ impl Symbol {
             }]))),
             _ => {
                 self.value = true;
-                self.documentation = documentation;
+                self.documentation = markdown(documentation);
                 self.references.push((node.url(url), Reference::Define));
                 Ok(())
             },
@@ -412,7 +422,7 @@ impl Backend {
         Ok(traverse)
     }
 
-    async fn find_documentation(&self, url: &Url, position: Position) -> Option<String> {
+    async fn find_documentation(&self, url: &Url, position: Position) -> Option<MarkupContent> {
         let file = self.files.get(url)?;
         let point = W(position).into();
         let node = file.tree.root_node().descendant_for_point_range(point, point).map(W)?;
@@ -585,7 +595,13 @@ impl LanguageServer for Backend {
         trace!("textDocument/hover request");
         let document = params.text_document_position_params;
         let documentation = self.find_documentation(&document.text_document.uri, document.position).await;
-        Ok(documentation.and_then(|s| if s.is_empty() { None } else { Some(s) }).map(hover_markdown))
+        Ok(documentation
+            .and_then(|s| if s.value.is_empty() { None } else { Some(s) })
+            .map(|s| Hover {
+                contents: HoverContents::Markup(s),
+                range: None,
+            })
+        )
     }
 
 }
@@ -901,7 +917,7 @@ mod tests {
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
         let definition = scope.definitions.get("A").expect("undefined");
-        assert_eq!(definition.documentation, "documentation\nfor A\n");
+        assert_eq!(definition.documentation, markdown("documentation\nfor A\n"));
     }
 
     #[tokio::test]
