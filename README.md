@@ -12,8 +12,8 @@ Currently all features work only for macros
 - [x] Hover
 - [x] Autocompletion
 - [x] Go to definition
+- [x] Find references
 - [ ] Rename
-- [ ] Find references
 - [ ] Dynamic type checking
 - [ ] Code formatting
 

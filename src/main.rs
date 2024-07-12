@@ -25,17 +25,11 @@ use tracing::{info, trace, warn};
 
 use crate::parser_pool::new_pool;
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-enum Reference {
-    Define,
-    Undef,
-    Ref,
-}
-
 #[derive(Debug, Clone)]
 struct Symbol {
     value: bool,
-    references: Vec<(Location, Reference)>,
+    references: Vec<Location>,
+    definition: Option<Location>,
     documentation: MarkupContent,
 }
 
@@ -44,6 +38,7 @@ impl Default for Symbol {
         Self {
             value: false,
             references: Vec::new(),
+            definition: None,
             documentation: markdown(""),
         }
     }
@@ -52,8 +47,8 @@ impl Default for Symbol {
 impl Symbol {
 
     fn define(&mut self, url: &Url, node: W<Node>, documentation: String) -> std::result::Result<(), W<Diagnostic>> {
-        match self.references.last() {
-            Some((location, Reference::Define)) => Err(node.error(
+        match &self.definition {
+            Some(location) => Err(node.error(
                 "macro redefinition"
             ).with(Some(vec![DiagnosticRelatedInformation {
                 location: location.clone(),
@@ -62,18 +57,17 @@ impl Symbol {
             _ => {
                 self.value = true;
                 self.documentation = markdown(documentation);
-                self.references.push((node.url(url), Reference::Define));
+                self.definition = Some(node.url(url));
                 Ok(())
             },
         }
     }
 
     fn undefine(&mut self, url: &Url, node: W<Node>) -> std::result::Result<(), W<Diagnostic>> {
-        match self.references.last() {
-            Some((location, Reference::Undef)) => Err(Some(location.clone())),
+        match self.definition {
             Some(_) => {
                 self.value = false;
-                self.references.push((node.url(url), Reference::Undef));
+                self.references.push(node.url(url));
                 Ok(())
             },
             _ => Err(None),
@@ -86,10 +80,10 @@ impl Symbol {
     }
 
     fn reference(&mut self, url: &Url, node: W<Node>) -> std::result::Result<bool, W<Diagnostic>> {
-        match self.references.last() {
+        match self.definition {
             //Some((location, Reference::Undef)) => Err(Some(location.clone())),
             Some(_) => {
-                self.references.push((node.url(url), Reference::Ref));
+                self.references.push(node.url(url));
                 Ok(self.value)
             },
             _ => Err(None),
@@ -506,11 +500,30 @@ impl Backend {
             _ => Err(Diagnostic::default()),
         }.ok()?.text(file.content.as_bytes()).ok()?;
         let symbol = file.definitions.get(word)?;
-        Some(symbol.references
-            .iter()
-            .filter_map(|(location, kind)| if *kind == Reference::Define { Some(location.clone()) } else { None })
-            .collect()
-        )
+        Some(vec![symbol.definition.clone()?])
+    }
+
+    async fn get_references(&self, url: &Url, position: Position, include_declaration: bool) -> Option<Vec<Location>> {
+        let file = self.files.get(url)?;
+        let point = W(position).into();
+        let node = file.tree.root_node().descendant_for_point_range(point, point).map(W)?;
+        let word = match node.kind() {
+            "identifier" => Ok(node),
+            "interpolation" => node.expect("variable"),
+            "function_call" | "function_definition" => node.expect("name"),
+            "usage" => node.expect("variable"),
+            "placeholder" => node.expect("argument"),
+            _ => Err(Diagnostic::default()),
+        }.ok()?.text(file.content.as_bytes()).ok()?;
+        let symbol = file.definitions.get(word)?;
+        let mut references = Vec::new();
+        if include_declaration {
+            if let Some(declaration) = &symbol.definition {
+                references.push(declaration.clone());
+            }
+        }
+        references.extend(symbol.references.iter().cloned());
+        Some(references)
     }
 
     fn new(client: Client) -> Result<Self> {
@@ -557,6 +570,7 @@ impl LanguageServer for Backend {
             capabilities: ServerCapabilities {
                 declaration_provider: Some(DeclarationCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec!["#"].into_iter().map(|x| x.to_owned()).collect()),
                     ..Default::default()
@@ -688,6 +702,12 @@ impl LanguageServer for Backend {
 
     async fn goto_definition(&self, params: GotoDefinitionParams) -> jsonrpc::Result<Option<GotoDefinitionResponse>> {
         self.goto_declaration(params).await
+    }
+
+    async fn references(&self, params: ReferenceParams) -> jsonrpc::Result<Option<Vec<Location>>> {
+        trace!("textDocument/references {:?}", params);
+        let pos = params.text_document_position;
+        Ok(self.get_references(&pos.text_document.uri, pos.position, params.context.include_declaration).await)
     }
 
 }
@@ -1129,6 +1149,48 @@ mod tests {
         else {
             panic!("wrong completion type")
         }
+    }
+
+    #[tokio::test]
+    async fn references() {
+        let (uri, service) = make_with_file("memory:///references.bff", "#define A\n#if A\n#endif").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        assert_eq!(scope.diagnostics, Vec::new());
+        let references = backend.references(ReferenceParams {
+            text_document_position: TextDocumentPositionParams::new(TextDocumentIdentifier::new(uri.clone()), Position::new(1, 4)),
+            work_done_progress_params: WorkDoneProgressParams { work_done_token: None },
+            partial_result_params: PartialResultParams { partial_result_token: None },
+            context: ReferenceContext { include_declaration: true },
+        }).await.expect("no completion").expect("no completion");
+        let reference = references.first().expect("no references");
+        assert_eq!(reference.uri, uri);
+        assert_eq!(reference.range.start, Position::new(0, 8));
+        assert_eq!(reference.range.end, Position::new(0, 9));
+        let reference = references.get(1).expect("no references");
+        assert_eq!(reference.uri, uri);
+        assert_eq!(reference.range.start, Position::new(1, 4));
+        assert_eq!(reference.range.end, Position::new(1, 5));
+    }
+
+    #[tokio::test]
+    async fn references_without_declaration() {
+        let (uri, service) = make_with_file("memory:///references_without_declaration.bff", "#define A\n#if A\n#endif").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        assert_eq!(scope.diagnostics, Vec::new());
+        let references = backend.references(ReferenceParams {
+            text_document_position: TextDocumentPositionParams::new(TextDocumentIdentifier::new(uri.clone()), Position::new(1, 4)),
+            work_done_progress_params: WorkDoneProgressParams { work_done_token: None },
+            partial_result_params: PartialResultParams { partial_result_token: None },
+            context: ReferenceContext { include_declaration: false },
+        }).await.expect("no completion").expect("no completion");
+        let reference = references.first().expect("no references");
+        assert_eq!(reference.uri, uri);
+        assert_eq!(reference.range.start, Position::new(1, 4));
+        assert_eq!(reference.range.end, Position::new(1, 5));
     }
 
 }
