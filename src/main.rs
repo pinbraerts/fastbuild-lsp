@@ -277,7 +277,7 @@ impl Backend {
     fn search_file(&self, url: &Url, path: &str) -> Option<Url> {
         if url.scheme() == "file" {
             if let Ok(current) = std::env::current_dir() {
-                if let Ok(path) = Url::from_file_path(current.parent()?.join(path)) {
+                if let Ok(path) = Url::from_file_path(current.join(path)) {
                     return Some(path);
                 }
             }
