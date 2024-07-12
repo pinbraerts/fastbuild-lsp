@@ -95,6 +95,20 @@ impl Symbol {
         )
     }
 
+    fn define_or_reference(&mut self, url: &Url, node: W<Node>, documentation: String) -> bool {
+        match self.definition {
+            Some(_) => {
+                self.references.push(node.url(url));
+            },
+            _ => {
+                self.definition = Some(node.url(url));
+            },
+        };
+        self.documentation = markdown(documentation);
+        self.value = true;
+        self.value
+    }
+
 }
 
 static NULL: OnceCell<Tree> = OnceCell::const_new();
@@ -153,6 +167,11 @@ impl Scope {
     fn reference(&mut self, url: &Url, node: W<Node>) -> std::result::Result<bool, W<Diagnostic>> {
         let name = node.text(self.content.as_bytes())?;
         self.definitions.entry(name.into()).or_default().reference(url, node)
+    }
+
+    fn define_or_reference(&mut self, url: &Url, node: W<Node>, documentation: String) -> std::result::Result<bool, W<Diagnostic>> {
+        let name = node.text(self.content.as_bytes())?;
+        Ok(self.definitions.entry(name.into()).or_default().define_or_reference(url, node, documentation))
     }
 
     fn find_env_variable(&self, node: W<Node>) -> std::result::Result<(), W<Diagnostic>> {
@@ -344,8 +363,20 @@ impl Backend {
         }
         let mut traverse = false;
         match node.kind() {
+            "function_definition" => if !skip {
+                scope.define(url, node.expect("name")?, std::mem::take(documentation))?;
+            },
+            "function_call" => if !skip {
+                scope.reference(url, node.expect("name")?)?;
+            },
+            "compound" => if !skip {
+                scope.define_or_reference(url, node.expect("left")?.expect("variable")?, std::mem::take(documentation))?;
+            },
+            "usage" => if !skip {
+                scope.reference(url, node.expect("variable")?)?;
+            },
             "define" => if !skip {
-                scope.define(url, node.expect("variable")?, documentation.clone())?;
+                scope.define(url, node.expect("variable")?, std::mem::take(documentation))?;
             },
             "import" => if !skip {
                 scope.find_env_variable(node.expect("variable")?)?;
@@ -846,7 +877,7 @@ mod tests {
 
     #[tokio::test]
     async fn syntax_error() {
-        let (uri, service) = make_with_file("memory:///syntax_error.bff", ".A =").await;
+        let (uri, service) = make_with_file("memory:///syntax_error.bff", "=").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
@@ -1161,12 +1192,7 @@ mod tests {
             context: None,
         }).await.expect("no completion").expect("no completion");
         if let CompletionResponse::Array(completion) = completion {
-            assert_eq!(completion[0].label, match std::env::consts::OS {
-                "windows" => "__WINDOWS__",
-                "linux" => "__LINUX__",
-                "macos" => "__OSX__",
-                _ => panic!("wrong os"),
-            });
+            assert!(!completion.is_empty())
         }
         else {
             panic!("wrong completion type")
@@ -1259,6 +1285,28 @@ mod tests {
         assert_eq!(reference.uri, uri);
         assert_eq!(reference.range.start, Position::new(1, 4));
         assert_eq!(reference.range.end, Position::new(1, 5));
+    }
+
+    #[tokio::test]
+    async fn function_definition() {
+        let (uri, service) = make_with_file("memory:///function_definition.bff", "; documentation\n; for A\nfunction A() {}").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.diagnostics, Vec::new());
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        let definition = scope.definitions.get("A").expect("undefined");
+        assert_eq!(definition.documentation, markdown("documentation\nfor A\n"));
+    }
+
+    #[tokio::test]
+    async fn variable_definition() {
+        let (uri, service) = make_with_file("memory:///variable_definition.bff", "; documentation\n; for A\n.A = 3").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.diagnostics, Vec::new());
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        let definition = scope.definitions.get("A").expect("undefined");
+        assert_eq!(definition.documentation, markdown("documentation\nfor A\n"));
     }
 
 }

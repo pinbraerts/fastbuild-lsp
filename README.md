@@ -4,8 +4,6 @@ A language server for [FASTBuild](https://fastbuild.org)
 
 ## Features
 
-Currently all features work only for macros
-
 - [x] Syntax checking
 - [x] Diagnostics
 - [x] Semantic tokens
@@ -15,7 +13,7 @@ Currently all features work only for macros
 - [x] Find references
 - [ ] Rename
 - [ ] Dynamic type checking
-- [ ] Code formatting
+- [ ] Code actions/suggestions
 
 ## Installation
 
