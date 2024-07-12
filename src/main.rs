@@ -518,6 +518,7 @@ pub fn hover_markdown(value: impl Into<String>) -> Hover {
 impl LanguageServer for Backend {
 
     async fn initialize(&self, _: InitializeParams) -> jsonrpc::Result<InitializeResult> {
+        trace!("initialize");
         for (url, content) in self.builtins.iter() {
             let _ = self.on_file_update(url.clone(), 0, content.clone()).await;
         }
@@ -564,15 +565,17 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
+        trace!("initialized");
         self.client.log_message(MessageType::INFO, "server initialized!").await;
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {
+        trace!("shutdown");
         Ok(())
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        info!("text document open {:?}", params.text_document.uri);
+        trace!("textDocument/didOpen {:?}", params.text_document.uri);
         let document = params.text_document;
         if document.language_id != "fastbuild" {
             return;
@@ -585,7 +588,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, mut params: DidChangeTextDocumentParams) {
-        info!("text document change {:?}", params.text_document.uri);
+        trace!("textDocument/didChange {:?}", params.text_document.uri);
         let document = params.text_document;
         if params.content_changes.len() != 1 {
             warn!("file changes: {:?}", params.content_changes);
@@ -599,7 +602,7 @@ impl LanguageServer for Backend {
     }
 
     async fn semantic_tokens_full(&self, params: SemanticTokensParams) -> jsonrpc::Result<Option<SemanticTokensResult>> {
-        info!("textDocument/semanticTokens/full {:?}", params);
+        trace!("textDocument/semanticTokens/full {:?}", params);
         let mut prev = SemanticToken::default();
         Ok(self.files
             .get(&params.text_document.uri)
@@ -624,7 +627,7 @@ impl LanguageServer for Backend {
     // }
 
     async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {
-        trace!("textDocument/hover request");
+        trace!("textDocument/hover {:?}", params);
         let document = params.text_document_position_params;
         let documentation = self.find_documentation(&document.text_document.uri, document.position).await;
         Ok(documentation
@@ -637,7 +640,7 @@ impl LanguageServer for Backend {
     }
 
     async fn completion(&self, params: CompletionParams) -> jsonrpc::Result<Option<CompletionResponse>> {
-        trace!("textDocument/completion request");
+        trace!("textDocument/completion {:?}", params);
         let pos = params.text_document_position;
         Ok(self.suggest_completions(pos.text_document.uri, pos.position, params.context.and_then(|x| x.trigger_character).unwrap_or_default())
             .await
