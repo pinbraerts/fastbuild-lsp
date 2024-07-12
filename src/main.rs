@@ -554,6 +554,25 @@ mod tests {
         (uri, service)
     }
 
+    async fn make_with_files(files: Vec<(&str, &str)>) -> (Vec<Url>, LspService<Backend>) {
+        let service = make().await;
+        let backend = service.inner();
+        let mut urls = Vec::new();
+        for (uri, content) in files {
+            let uri = Url::parse(uri).expect("failed to parse url");
+            backend.did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "fastbuild".into(),
+                    version: 0,
+                    text: content.into(),
+                },
+            }).await;
+            urls.push(uri);
+        }
+        (urls, service)
+    }
+
     #[tokio::test]
     async fn syntax_error() {
         let (uri, service) = make_with_file("memory:///syntax_error.bff", ".A =").await;
@@ -752,6 +771,30 @@ mod tests {
                 assert!(scope.definitions.get("__OSX__").is_none());
             },
             _ => {},
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_include() {
+        let (urls, service) = make_with_files(vec![
+            ("memory:///multi_include1.bff", "\n#define A\n#if 0\n.A = 3\n#else\n#undef A\n#endif"),
+            ("memory:///multi_include2.bff", "#include \"multi_include1.bff\"\n#define B\n#if A\n#undef B\n#endif"),
+            ("memory:///multi_include3.bff", "#include \"multi_include2.bff\"\n#define C\n#if !B\n#undef C\n#endif"),
+        ]).await;
+        let backend = service.inner();
+        for x in backend.files.iter() {
+            let scope = x.value();
+            let url = x.key();
+            assert_eq!(scope.diagnostics, Vec::new());
+            if urls.contains(url) {
+                assert_eq!(scope.semantic_tokens, vec![SemanticToken {
+                    delta_line: 3,
+                    delta_start: 0,
+                    length: u32::max_value(),
+                    token_type: 0,
+                    token_modifiers_bitset: 0,
+                }]);
+            }
         }
     }
 
