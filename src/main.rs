@@ -594,6 +594,7 @@ mod tests {
         let scope = backend.files.get(&uri).expect("no file");
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
         assert_eq!(diagnostic.message, "syntax");
+        assert_eq!(scope.semantic_tokens, Vec::new());
     }
 
     #[tokio::test]
@@ -602,6 +603,7 @@ mod tests {
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
+        assert_eq!(scope.semantic_tokens, Vec::new());
         assert_eq!(diagnostic.message, "macro redefinition");
         let binding = diagnostic.related_information.clone().expect("no related information");
         let related = binding.first().expect("no related entrys");
@@ -616,6 +618,7 @@ mod tests {
         let (uri, service) = make_with_file("memory:///import_not_found.bff", "#import __SURELYNOSUCHENVVAR").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.semantic_tokens, Vec::new());
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
         assert_eq!(diagnostic.message, "environment variable not found");
         assert_eq!(diagnostic.range.start.line, 0);
@@ -629,7 +632,8 @@ mod tests {
         let (uri, service) = make_with_file("memory:///undefine.bff", "#define A\n#undef A").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
-        assert_eq!(scope.diagnostics, vec!());
+        assert_eq!(scope.diagnostics, Vec::new());
+        assert_eq!(scope.semantic_tokens, Vec::new());
     }
 
     #[tokio::test]
@@ -637,6 +641,7 @@ mod tests {
         let (uri, service) = make_with_file("memory:///undefined.bff", "#undef A").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.semantic_tokens, Vec::new());
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
         assert_eq!(diagnostic.message, "trying to undefine undefined macro");
         assert_eq!(diagnostic.range.start.line, 0);
@@ -651,6 +656,7 @@ mod tests {
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         assert_eq!(scope.diagnostics, vec!());
+        assert_eq!(scope.semantic_tokens, Vec::new());
     }
 
     #[tokio::test]
@@ -659,6 +665,8 @@ mod tests {
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
         assert!(scope.once);
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        assert_eq!(scope.diagnostics, Vec::new());
     }
 
     #[tokio::test]
@@ -666,6 +674,7 @@ mod tests {
         let (uri, service) = make_with_file("memory:///preprocessor_if.bff", "#if 1\n.A = 3\n#else\n.B = 4\n#endif").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.diagnostics, Vec::new());
         let token = scope.semantic_tokens.first().expect("no semantic tokens");
         assert_eq!(token.delta_line, 3);
         assert_eq!(token.delta_start, 0);
@@ -679,6 +688,7 @@ mod tests {
         let (uri, service) = make_with_file("memory:///preprocessor_else.bff", "#if 0\n.A = 3\n#else\n.B = 4\n#endif").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.diagnostics, Vec::new());
         let token = scope.semantic_tokens.first().expect("no semantic tokens");
         assert_eq!(token.delta_line, 1, "mismatching lines");
         assert_eq!(token.delta_start, 0, "mismatching columns");
@@ -692,6 +702,7 @@ mod tests {
         let (uri, service) = make_with_file("memory:///preprocessor_if_missing.bff", "#define A\n#if 1\n#undef A\n\n#endif\n#if A\n.A = 3\n#endif").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.diagnostics, Vec::new());
         let token = scope.semantic_tokens.first().expect("no semantic tokens");
         assert_eq!(scope.diagnostics, vec![]);
         assert_eq!(token.delta_line, 6, "mismatching lines");
@@ -706,6 +717,7 @@ mod tests {
         let (uri, service) = make_with_file("memory:///preprocessor_if_missing.bff", "#else").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.semantic_tokens, Vec::new());
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
         assert_eq!(diagnostic.message, "expected #if");
         assert_eq!(diagnostic.range.start.line, 0);
@@ -719,6 +731,7 @@ mod tests {
         let (uri, service) = make_with_file("memory:///preprocessor_if_missing.bff", "#if 1").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.semantic_tokens, Vec::new());
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
         assert_eq!(diagnostic.message, "expected #endif");
         assert_eq!(diagnostic.range.start.line, 0);
@@ -732,6 +745,7 @@ mod tests {
         let (uri, service) = make_with_file("memory:///preprocessor_unknown.bff", "#unknown").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.semantic_tokens, Vec::new());
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
         assert_eq!(diagnostic.message, "unknown directive");
         assert_eq!(diagnostic.range.start.line, 0);
@@ -745,7 +759,8 @@ mod tests {
         let (uri, service) = make_with_file("memory:///builtins/preprocessor_include.bff", "#include \"alias.bff\"").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
-        assert_eq!(scope.diagnostics, vec![]);
+        assert_eq!(scope.diagnostics, Vec::new());
+        assert_eq!(scope.semantic_tokens, Vec::new());
     }
 
     #[tokio::test]
@@ -768,6 +783,8 @@ mod tests {
         let (uri, service) = make_with_file("memory:///os.bff", "").await;
         let backend = service.inner();
         let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        assert_eq!(scope.diagnostics, Vec::new());
         match std::env::consts::OS {
             "linux" => {
                 assert!(matches!(scope.definitions.get("__LINUX__"), Some(Symbol { value: true, .. })));
@@ -808,6 +825,9 @@ mod tests {
                     token_type: 0,
                     token_modifiers_bitset: 0,
                 }]);
+            }
+            else {
+                assert_eq!(scope.semantic_tokens, Vec::new());
             }
         }
     }
