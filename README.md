@@ -8,7 +8,7 @@ A language server for [FASTBuild](https://fastbuild.org)
 - [x] Diagnostics
 - [x] Semantic tokens (only for faulty `#if` branches)
 - [x] Hover (only for macros)
-- [ ] Autocompletion
+- [x] Autocompletion (only for macros)
 - [ ] Go to definition
 - [ ] Rename
 - [ ] Find references

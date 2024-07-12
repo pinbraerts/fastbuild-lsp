@@ -9,7 +9,8 @@ use futures::FutureExt;
 use helpers::W;
 use tokio::io::AsyncReadExt;
 use tokio::sync::OnceCell;
-use tree_sitter::{Node, Parser, Tree};
+use tower_lsp::lsp_types::Documentation;
+use tree_sitter::{Node, Parser, Point, Tree};
 
 use tokio::fs::File;
 
@@ -454,6 +455,33 @@ impl Backend {
         Some(symbol.documentation.clone())
     }
 
+    async fn suggest_completions(&self, url: Url, position: Position, trigger: String) -> Option<Vec<CompletionItem>> {
+        let file = self.files.get(&url)?;
+        let point: Point = W(position).into();
+        let node = file.tree.root_node().descendant_for_point_range(point, point).map(W)?;
+        if trigger == "#" || node.kind().starts_with("preprocessor_") {
+            Some(vec!["import", "if", "define", "include", "undef", "endif", "else"]
+                .into_iter()
+                .map(|x| CompletionItem {
+                    label: x.into(),
+                    kind: Some(CompletionItemKind::SNIPPET),
+                    ..Default::default()
+                })
+                .collect())
+        }
+        else {
+            Some(file.definitions
+                .iter()
+                .map(|(name, definition)| CompletionItem {
+                    label: name.clone(),
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    documentation: Some(Documentation::MarkupContent(definition.documentation.clone())),
+                    ..Default::default()
+                })
+                .collect())
+        }
+    }
+
     fn new(client: Client) -> Result<Self> {
         let mut builtins = HashMap::new();
         builtins.insert(Url::parse("memory:///builtins/alias.bff")?, include_str!("../builtins/alias.bff").into());
@@ -497,6 +525,10 @@ impl LanguageServer for Backend {
             capabilities: ServerCapabilities {
                 // declaration_provider: Some(DeclarationCapability::Simple(true)),
                 // definition_provider: Some(OneOf::Left(true)),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec!["#"].into_iter().map(|x| x.to_owned()).collect()),
+                    ..Default::default()
+                }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
                 semantic_tokens_provider: Some(
@@ -601,6 +633,15 @@ impl LanguageServer for Backend {
                 contents: HoverContents::Markup(s),
                 range: None,
             })
+        )
+    }
+
+    async fn completion(&self, params: CompletionParams) -> jsonrpc::Result<Option<CompletionResponse>> {
+        trace!("textDocument/completion request");
+        let pos = params.text_document_position;
+        Ok(self.suggest_completions(pos.text_document.uri, pos.position, params.context.and_then(|x| x.trigger_character).unwrap_or_default())
+            .await
+            .map(CompletionResponse::Array)
         )
     }
 
@@ -938,6 +979,66 @@ mod tests {
                 },
             }).await.expect("no hover").expect("no hover");
             assert_eq!(hover, hover_markdown("documentation\nfor A\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_preprocessor() {
+        let (uri, service) = make_with_file("memory:///complete_preprocessor.bff", "#").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        let completion = backend.completion(CompletionParams {
+            text_document_position: TextDocumentPositionParams::new(
+                TextDocumentIdentifier::new(uri),
+                Position::new(0, 1),
+            ),
+            work_done_progress_params: WorkDoneProgressParams { work_done_token: None, },
+            partial_result_params: PartialResultParams { partial_result_token: None },
+            context: Some(CompletionContext {
+                trigger_kind: CompletionTriggerKind::TRIGGER_CHARACTER,
+                trigger_character: Some("#".to_owned()),
+            }),
+        }).await.expect("no completion").expect("no completion");
+        if let CompletionResponse::Array(completion) = completion {
+            assert_eq!(completion[0].label, "import");
+            assert_eq!(completion[1].label, "if");
+            assert_eq!(completion[2].label, "define");
+            assert_eq!(completion[3].label, "include");
+            assert_eq!(completion[4].label, "undef");
+            assert_eq!(completion[5].label, "endif");
+            assert_eq!(completion[6].label, "else");
+        }
+        else {
+            panic!();
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_value() {
+        let (uri, service) = make_with_file("memory:///complete_value.bff", "#if ").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        let completion = backend.completion(CompletionParams {
+            text_document_position: TextDocumentPositionParams::new(
+                TextDocumentIdentifier::new(uri),
+                Position::new(0, 3),
+            ),
+            work_done_progress_params: WorkDoneProgressParams { work_done_token: None, },
+            partial_result_params: PartialResultParams { partial_result_token: None },
+            context: None,
+        }).await.expect("no completion").expect("no completion");
+        if let CompletionResponse::Array(completion) = completion {
+            assert_eq!(completion[0].label, match std::env::consts::OS {
+                "windows" => "__WINDOWS__",
+                "linux" => "__LINUX__",
+                "macos" => "__OSX__",
+                _ => panic!("wrong os"),
+            });
+        }
+        else {
+            panic!("wrong completion type")
         }
     }
 
