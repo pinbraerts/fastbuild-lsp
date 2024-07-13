@@ -25,6 +25,12 @@ use tracing::{info, trace, warn};
 
 use crate::parser_pool::new_pool;
 
+enum Traverse {
+    Not,
+    Yes,
+    Comment,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum Value {
     Macro(bool),
@@ -255,6 +261,7 @@ impl Backend {
             self.client.log_message(MessageType::LOG, format!("analysing {}", url)).await;
             let mut cursor = tree.walk();
             let mut if_stack = vec![];
+            let mut doc_stack = vec![];
             let mut run = true;
             let mut scope = Scope::new(version, content);
             if !self.builtins.contains_key(&url) {
@@ -270,10 +277,14 @@ impl Backend {
                 let traverse = self.enter_node(&url, &mut scope, cursor.node().into(), &mut if_stack, &mut documentation).await;
                 match traverse {
                     Err(diagnostic) => scope.diagnostics.push(diagnostic.0),
-                    Ok(true) => {
+                    Ok(Traverse::Yes) => {
                         if cursor.goto_first_child() {
+                            doc_stack.push(std::mem::take(&mut documentation));
                             continue;
                         }
+                    },
+                    Ok(Traverse::Not) => {
+                        documentation.clear();
                     },
                     _ => {},
                 }
@@ -282,6 +293,12 @@ impl Backend {
                         run = false;
                         break;
                     }
+                    let node = W(cursor.node());
+                    let doc = doc_stack
+                        .pop()
+                        .ok_or_else(|| scope.diagnostics.push(node.error("internal: docs stack drained").0))
+                        .unwrap_or_default();
+                    let _ = self.exit_node(&url, &mut scope, node, doc);
                 }
             }
             for (_, n_if, n_else) in if_stack {
@@ -387,11 +404,11 @@ impl Backend {
         Some(result)
     }
 
-    async fn enter_node<'tree>(&self, url: &Url, scope: &mut Scope, node: W<Node<'tree>>, if_stack: &mut IfStack<'tree>, documentation: &mut String) -> std::result::Result<bool, W<Diagnostic>> {
+    async fn enter_node<'tree>(&self, url: &Url, scope: &mut Scope, node: W<Node<'tree>>, if_stack: &mut IfStack<'tree>, documentation: &mut String) -> std::result::Result<Traverse, W<Diagnostic>> {
         if !node.is_named() {
-            return Ok(false);
+            return Ok(Traverse::Comment);
         }
-        let mut traverse = false;
+        let mut traverse = Traverse::Not;
         match node.kind() {
             "if" => {
                 let condition = node.expect("condition")?;
@@ -447,24 +464,6 @@ impl Backend {
             return Ok(traverse);
         }
         match node.kind() {
-            "function_definition" => {
-                scope.define(url, node.expect("name")?, std::mem::take(documentation), Value::Function)?;
-            },
-            "function_call" => {
-                scope.reference(url, node.expect("name")?)?;
-            },
-            "compound" => {
-                let variable = node.expect("left")?.expect("variable")?;
-                let value = self.parse_expression(url, scope, node.get(1)?.expect("right")?)?;
-                scope.define_or_reference(url,
-                    variable,
-                    std::mem::take(documentation),
-                    value
-                )?;
-            },
-            "usage" => {
-                scope.reference(url, node.expect("variable")?)?;
-            },
             "define" => {
                 scope.define(url, node.expect("variable")?, std::mem::take(documentation), Value::Macro(true))?;
             },
@@ -493,14 +492,39 @@ impl Backend {
                 let text = node.text(scope.content.as_bytes())?;
                 *documentation += text.get(2..).unwrap_or_default();
                 documentation.push('\n');
-                return Ok(false);
+                traverse = Traverse::Comment;
             },
             _ => {
-                traverse = true;
+                traverse = Traverse::Yes;
             },
         }
-        documentation.clear();
         Ok(traverse)
+    }
+
+    fn exit_node(&self, url: &Url, scope: &mut Scope, node: W<Node<'_>>, documentation: String) -> std::result::Result<(), W<Diagnostic>> {
+        match node.kind() {
+            "function_definition" => {
+                scope.define(url, node.expect("name")?, documentation, Value::Function)?;
+            },
+            "function_call" => {
+                scope.reference(url, node.expect("name")?)?;
+            },
+            "compound" => {
+                let variable = node.expect("left")?.expect("variable")?;
+                let value = self.parse_expression(url, scope, node.get(1)?.expect("right")?)?;
+                scope.define_or_reference(url,
+                    variable,
+                    documentation,
+                    value
+                )?;
+            },
+            "usage" => {
+                scope.reference(url, node.expect("variable")?)?;
+            },
+            _ => {
+            },
+        };
+        Ok(())
     }
 
     fn parse_expression(&self, url: &Url, scope: &mut Scope, node: W<Node<'_>>) -> std::result::Result<Value, W<Diagnostic>> {
@@ -1402,6 +1426,49 @@ mod tests {
         assert_eq!(definition.documentation, markdown("documentation\nfor A\n"));
         assert_eq!(definition.value, Some(Value::Number(3)));
         assert_eq!(definition.definition, Some(Location::new(uri, Range::new(Position::new(2, 1), Position::new(2, 2)))));
+    }
+
+    #[tokio::test]
+    async fn nested_declaration() {
+        let (uri, service) = make_with_file("memory:///nested_declaration.bff", "function A() {\n; documentation\n; for B\n.B = 3\n}").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.diagnostics, Vec::new());
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        let definition = scope.definitions.get("B").expect("undefined");
+        assert_eq!(definition.documentation, markdown("documentation\nfor B\n"));
+        assert_eq!(definition.value, Some(Value::Number(3)));
+        assert_eq!(definition.definition, Some(Location::new(uri, Range::new(Position::new(3, 1), Position::new(3, 2)))));
+    }
+
+    #[tokio::test]
+    async fn nested_preprocessor() {
+        let (uri, service) = make_with_file("memory:///nested_preprocessor.bff", "function A() {\n#if 1\n.B = 3\n#else\n.C = 4\n#endif\n}").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.diagnostics, Vec::new());
+        assert_eq!(scope.semantic_tokens, vec![SemanticToken {
+            delta_start: 0,
+            delta_line: 4,
+            length: u32::max_value(),
+            token_type: 0,
+            token_modifiers_bitset: 0,
+        }]);
+    }
+
+    #[tokio::test]
+    async fn preprocessor_in_compound() {
+        let (uri, service) = make_with_file("memory:///nested_preprocessor.bff", "function A() {.B = \"B\"\n#if 1\n+ \"A\"\n#else\n- \"B\"\n#endif\n}").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.diagnostics, Vec::new());
+        assert_eq!(scope.semantic_tokens, vec![SemanticToken {
+            delta_start: 0,
+            delta_line: 4,
+            length: u32::max_value(),
+            token_type: 0,
+            token_modifiers_bitset: 0,
+        }]);
     }
 
 }
