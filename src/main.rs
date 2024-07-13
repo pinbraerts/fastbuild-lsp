@@ -25,9 +25,36 @@ use tracing::{info, trace, warn};
 
 use crate::parser_pool::new_pool;
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum Value {
+    Macro(bool),
+    String(String),
+    Number(i32),
+    //Array,
+    Function,
+}
+
+impl From<&Value> for bool {
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::Macro(v) => *v,
+            Value::String(s) => !s.is_empty(),
+            Value::Number(n) => *n != 0,
+            //Value::Array => true,
+            Value::Function => true,
+        }
+    }
+}
+
+impl Value {
+    fn as_bool(&self) -> bool {
+        self.into()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Symbol {
-    value: bool,
+    value: Option<Value>,
     references: Vec<Location>,
     definition: Option<Location>,
     documentation: MarkupContent,
@@ -36,9 +63,9 @@ struct Symbol {
 impl Default for Symbol {
     fn default() -> Self {
         Self {
-            value: false,
-            references: Vec::new(),
-            definition: None,
+            value: Default::default(),
+            references: Default::default(),
+            definition: Default::default(),
             documentation: markdown(""),
         }
     }
@@ -46,7 +73,7 @@ impl Default for Symbol {
 
 impl Symbol {
 
-    fn define(&mut self, url: &Url, node: W<Node>, documentation: String) -> std::result::Result<(), W<Diagnostic>> {
+    fn define(&mut self, url: &Url, node: W<Node>, documentation: String, value: Value) -> std::result::Result<(), W<Diagnostic>> {
         match &self.definition {
             Some(location) => Err(node.error(
                 "macro redefinition"
@@ -55,7 +82,7 @@ impl Symbol {
                 message: "defined here".into(),
             }]))),
             _ => {
-                self.value = true;
+                self.value = Some(value);
                 self.documentation = markdown(documentation);
                 self.definition = Some(node.url(url));
                 Ok(())
@@ -66,7 +93,7 @@ impl Symbol {
     fn undefine(&mut self, url: &Url, node: W<Node>) -> std::result::Result<(), W<Diagnostic>> {
         match self.definition {
             Some(_) => {
-                self.value = false;
+                self.value = None;
                 self.references.push(node.url(url));
                 Ok(())
             },
@@ -79,12 +106,12 @@ impl Symbol {
         )
     }
 
-    fn reference(&mut self, url: &Url, node: W<Node>) -> std::result::Result<bool, W<Diagnostic>> {
-        match self.definition {
+    fn reference(&mut self, url: &Url, node: W<Node>) -> std::result::Result<Value, W<Diagnostic>> {
+        match &self.definition {
             //Some((location, Reference::Undef)) => Err(Some(location.clone())),
             Some(_) => {
                 self.references.push(node.url(url));
-                Ok(self.value)
+                Ok(self.value.clone().unwrap_or(Value::Macro(false)))
             },
             _ => Err(None),
         }.map_err(|location| node.error("accessing undefined variable")
@@ -95,7 +122,7 @@ impl Symbol {
         )
     }
 
-    fn define_or_reference(&mut self, url: &Url, node: W<Node>, documentation: String) -> bool {
+    fn define_or_reference(&mut self, url: &Url, node: W<Node>, documentation: String, value: Value) -> Value {
         match self.definition {
             Some(_) => {
                 self.references.push(node.url(url));
@@ -105,8 +132,8 @@ impl Symbol {
             },
         };
         self.documentation = markdown(documentation);
-        self.value = true;
-        self.value
+        self.value = Some(value);
+        self.value.clone().expect("just set it above")
     }
 
 }
@@ -154,9 +181,9 @@ impl Scope {
         }
     }
 
-    fn define(&mut self, url: &Url, node: W<Node>, documentation: String) -> std::result::Result<(), W<Diagnostic>> {
+    fn define(&mut self, url: &Url, node: W<Node>, documentation: String, value: Value) -> std::result::Result<(), W<Diagnostic>> {
         let name = node.text(self.content.as_bytes())?;
-        self.definitions.entry(name.into()).or_default().define(url, node, documentation)
+        self.definitions.entry(name.into()).or_default().define(url, node, documentation, value)
     }
 
     fn undefine(&mut self, url: &Url, node: W<Node>) -> std::result::Result<(), W<Diagnostic>> {
@@ -164,14 +191,14 @@ impl Scope {
         self.definitions.entry(name.into()).or_default().undefine(url, node)
     }
 
-    fn reference(&mut self, url: &Url, node: W<Node>) -> std::result::Result<bool, W<Diagnostic>> {
+    fn reference(&mut self, url: &Url, node: W<Node>) -> std::result::Result<Value, W<Diagnostic>> {
         let name = node.text(self.content.as_bytes())?;
         self.definitions.entry(name.into()).or_default().reference(url, node)
     }
 
-    fn define_or_reference(&mut self, url: &Url, node: W<Node>, documentation: String) -> std::result::Result<bool, W<Diagnostic>> {
+    fn define_or_reference(&mut self, url: &Url, node: W<Node>, documentation: String, value: Value) -> std::result::Result<Value, W<Diagnostic>> {
         let name = node.text(self.content.as_bytes())?;
-        Ok(self.definitions.entry(name.into()).or_default().define_or_reference(url, node, documentation))
+        Ok(self.definitions.entry(name.into()).or_default().define_or_reference(url, node, documentation, value))
     }
 
     fn find_env_variable(&self, node: W<Node>) -> std::result::Result<(), W<Diagnostic>> {
@@ -299,7 +326,10 @@ impl Backend {
                 .parse::<i32>()
                 .unwrap_or_default() != 0,
             "identifier" => {
-                scope.reference(url, node)?
+                match scope.reference(url, node)? {
+                    Value::Macro(v) => v,
+                    _ => false,
+                }
             },
             "not" => {
                 !self.preprocess_expression(url, scope, node.expect("right")?)?
@@ -343,7 +373,7 @@ impl Backend {
         url.join(path).ok()
     }
 
-    fn find_file(&self, url: &Url, scope: &mut Scope, node: W<Node>) -> std::result::Result<Url, W<Diagnostic>> {
+    fn find_file(&self, url: &Url, scope: &Scope, node: W<Node>) -> std::result::Result<Url, W<Diagnostic>> {
         let path = node.text(scope.content.as_bytes())?;
         self.search_file(url, path).ok_or_else(|| node.error("could not find file"))
     }
@@ -364,19 +394,25 @@ impl Backend {
         let mut traverse = false;
         match node.kind() {
             "function_definition" => if !skip {
-                scope.define(url, node.expect("name")?, std::mem::take(documentation))?;
+                scope.define(url, node.expect("name")?, std::mem::take(documentation), Value::Function)?;
             },
             "function_call" => if !skip {
                 scope.reference(url, node.expect("name")?)?;
             },
             "compound" => if !skip {
-                scope.define_or_reference(url, node.expect("left")?.expect("variable")?, std::mem::take(documentation))?;
+                let variable = node.expect("left")?.expect("variable")?;
+                let value = self.parse_expression(url, scope, node.get(1)?.expect("right")?)?;
+                scope.define_or_reference(url,
+                    variable,
+                    std::mem::take(documentation),
+                    value
+                )?;
             },
             "usage" => if !skip {
                 scope.reference(url, node.expect("variable")?)?;
             },
             "define" => if !skip {
-                scope.define(url, node.expect("variable")?, std::mem::take(documentation))?;
+                scope.define(url, node.expect("variable")?, std::mem::take(documentation), Value::Macro(true))?;
             },
             "import" => if !skip {
                 scope.find_env_variable(node.expect("variable")?)?;
@@ -457,6 +493,55 @@ impl Backend {
         }
         documentation.clear();
         Ok(traverse)
+    }
+
+    fn parse_expression(&self, url: &Url, scope: &mut Scope, node: W<Node<'_>>) -> std::result::Result<Value, W<Diagnostic>> {
+        Ok(match node.kind() {
+            "string" => Value::String(node.text(scope.content.as_bytes())?.into()),
+            "decimal" => Value::Number(node
+                .text(scope.content.as_bytes())?
+                .parse::<i32>()
+                .unwrap_or_default()),
+            "identifier" => scope.reference(url, node)?,
+            "not" => {
+                let value = self.parse_expression(url, scope, node.expect("right")?)?;
+                if value.as_bool() {
+                    Value::Macro(false)
+                }
+                else {
+                    value
+                }
+            },
+            "and" => {
+                let left = self.parse_expression(url, scope, node.expect("left")?)?;
+                if !left.as_bool() {
+                    Value::Macro(false)
+                }
+                else {
+                    self.parse_expression(url, scope, node.expect("right")?)?
+                }
+            },
+            "or" => {
+                let left = self.parse_expression(url, scope, node.expect("left")?)?;
+                if left.as_bool() {
+                    left
+                }
+                else {
+                    self.parse_expression(url, scope, node.expect("right")?)?
+                }
+            },
+            "call" => {
+                let argument = node.expect("arguments")?;
+                match node.expect("name")?.text(scope.content.as_bytes())? {
+                    "exists" => scope.find_env_variable(argument),
+                    "file_exists" => self.find_file(url, scope, argument.expect("double_quoted")?).and(Ok(())),
+                    _ => Err(node.error("unknown function")),
+                }.and(Ok(Value::Macro(true)))?
+            },
+            _ => {
+                return Err(node.error("unknown expression"));
+            }
+        })
     }
 
     async fn find_documentation(&self, url: &Url, position: Position) -> Option<MarkupContent> {
@@ -1075,18 +1160,18 @@ mod tests {
         assert_eq!(scope.diagnostics, Vec::new());
         match std::env::consts::OS {
             "linux" => {
-                assert!(matches!(scope.definitions.get("__LINUX__"), Some(Symbol { value: true, .. })));
+                assert!(matches!(scope.definitions.get("__LINUX__"), Some(Symbol { value: Some(Value::Macro(true)), .. })));
                 assert!(scope.definitions.get("__WINDOWS__").is_none());
                 assert!(scope.definitions.get("__OSX__").is_none());
             },
             "macos" => {
                 assert!(scope.definitions.get("__LINUX__").is_none());
                 assert!(scope.definitions.get("__WINDOWS__").is_none());
-                assert!(matches!(scope.definitions.get("__OSX__"), Some(Symbol { value: true, .. })));
+                assert!(matches!(scope.definitions.get("__OSX__"), Some(Symbol { value: Some(Value::Macro(true)), .. })));
             },
             "windows" => {
                 assert!(scope.definitions.get("__LINUX__").is_none());
-                assert!(matches!(scope.definitions.get("__WINDOWS__"), Some(Symbol { value: true, .. })));
+                assert!(matches!(scope.definitions.get("__WINDOWS__"), Some(Symbol { value: Some(Value::Macro(true)), .. })));
                 assert!(scope.definitions.get("__OSX__").is_none());
             },
             _ => {},
@@ -1307,6 +1392,8 @@ mod tests {
         assert_eq!(scope.semantic_tokens, Vec::new());
         let definition = scope.definitions.get("A").expect("undefined");
         assert_eq!(definition.documentation, markdown("documentation\nfor A\n"));
+        assert_eq!(definition.value, Some(Value::Number(3)));
+        assert_eq!(definition.definition, Some(Location::new(uri, Range::new(Position::new(2, 1), Position::new(2, 2)))));
     }
 
 }

@@ -159,6 +159,10 @@ impl<'tree> W<Node<'tree>> {
         Location::new(url.clone(), self.into())
     }
 
+    pub fn get(self, index: usize) -> std::result::Result<Self, W<Diagnostic>> {
+        self.named_child(index).map(W).ok_or_else(|| self.error("expected named node"))
+    }
+
 }
 
 impl W<Diagnostic> {
