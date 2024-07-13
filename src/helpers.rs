@@ -1,7 +1,7 @@
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location, Position, Range, SemanticToken};
-use tree_sitter::{Point, Node};
+use tree_sitter::{Node, Point};
 use url::Url;
-use std::ops::{Deref, DerefMut};
+use std::{cmp::Ordering, ops::{Deref, DerefMut}};
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Default)]
 pub struct W<T>(pub T);
@@ -54,14 +54,29 @@ impl<'tree> From<W<Node<'tree>>> for Range {
 }
 
 impl PartialOrd for W<Range> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.start.cmp(&other.start))
     }
 }
 
 impl Ord for W<Range> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         self.start.cmp(&other.start)
+    }
+}
+
+impl PartialOrd for W<Position> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for W<Position> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.line.cmp(&other.line) {
+            Ordering::Equal => self.character.cmp(&other.character),
+            ordering => ordering,
+        }
     }
 }
 
@@ -100,6 +115,31 @@ impl W<tree_sitter::Range> {
         else {
             self.0.end_byte - self.0.start_byte
         }
+    }
+
+    pub fn complement(self, ranges: Vec<tree_sitter::Range>) -> Vec<tree_sitter::Range> {
+        let mut result = Vec::new();
+        let mut start_point = self.start_point;
+        let mut start_byte = self.start_byte;
+        for range in ranges {
+            result.push(tree_sitter::Range {
+                start_point,
+                start_byte,
+                end_point: range.start_point,
+                end_byte: range.start_byte,
+            });
+            start_point = range.end_point;
+            start_byte = range.end_byte;
+        }
+        if start_byte < self.end_byte {
+            result.push(tree_sitter::Range {
+                start_point,
+                start_byte,
+                end_point: self.end_point,
+                end_byte: self.end_byte,
+            });
+        }
+        result
     }
 
 }

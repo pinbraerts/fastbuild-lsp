@@ -157,6 +157,7 @@ struct Scope {
     content: String,
     references: HashSet<Url>,
     tree: Tree,
+    faulty_ranges: Vec<tree_sitter::Range>,
 }
 
 type IfStack<'tree> = Vec<(bool, W<Node<'tree>>, Option<W<Node<'tree>>>)>;
@@ -172,6 +173,7 @@ impl Default for Scope {
             content: Default::default(),
             references: Default::default(),
             tree: NULL.get().unwrap().clone(),
+            faulty_ranges: Default::default(),
         }
     }
 }
@@ -227,43 +229,40 @@ struct Backend {
 
 impl Backend {
 
-    async fn parse(&self, content: impl Into<&[u8]>) -> Result<Tree> {
-        Ok(self.parsers.get().await?.parse(content.into(), None).ok_or(Error::Parse)?)
-    }
-
-    async fn on_file_open(&self, url: Url) -> Result<()> {
+    async fn open_file(&self, url: Url) -> Result<()> {
         let entry = self.files.entry(url.clone());
         if let Entry::Occupied(_) = entry {
             return Ok(());
         }
         drop(entry);
         let content = self.get_content(url.clone()).await.ok_or(Error::Parse)?;
-        self.on_file_update(url, 0, content).await
+        self.read_file(url, 0, content).await
     }
 
-    async fn on_file_update(&self, url: Url, version: i32, content: String) -> Result<()> {
+    async fn read_file(&self, url: Url, version: i32, content: String) -> Result<()> {
         if let Entry::Occupied(entry) = self.files.entry(url.clone()) {
             if entry.get().version > version {
                 return Ok(());
             }
         }
-        self.on_text_change(url, version, content).await
+        self.preprocessor_parse(url, version, content).await
     }
 
-    async fn on_text_change(&self, url: Url, version: i32, content: String) -> Result<()> {
+    async fn preprocessor_parse(&self, url: Url, version: i32, content: String) -> Result<()> {
         self.client.log_message(MessageType::LOG, format!("parsing {}", url)).await;
-        let tree = self.parse(content.as_bytes()).await?;
-        self.on_tree_change(url, version, content, tree).await
+        let mut parser = self.parsers.get().await?;
+        let tree = parser.parse(content.as_bytes(), None).ok_or(Error::Parse)?;
+        self.preprocess(url, version, content, tree).await
     }
 
-    fn on_tree_change(&self, url: Url, version: i32, content: String, tree: Tree) -> BoxFuture<Result<()>> {
+    fn preprocess(&self, url: Url, version: i32, content: String, tree: Tree) -> BoxFuture<Result<()>> {
         async move {
-            self.client.log_message(MessageType::LOG, format!("analysing {}", url)).await;
+            self.client.log_message(MessageType::LOG, format!("preprocessing {}", url)).await;
             let mut cursor = tree.walk();
             let mut if_stack = vec![];
-            let mut doc_stack = vec![];
             let mut run = true;
             let mut scope = Scope::new(version, content);
+            let mut documentation = String::new();
             if !self.builtins.contains_key(&url) {
                 for (builtin_url, _) in self.builtins.iter() {
                     if let Some(file_scope) = self.files.get(builtin_url) {
@@ -272,19 +271,20 @@ impl Backend {
                     }
                 }
             }
-            let mut documentation = String::new();
             while run {
-                let traverse = self.enter_node(&url, &mut scope, cursor.node().into(), &mut if_stack, &mut documentation).await;
+                let traverse = self.preprocessor_enter_node(
+                    &url,
+                    &mut scope,
+                    cursor.node().into(),
+                    &mut if_stack,
+                    &mut documentation
+                ).await;
                 match traverse {
                     Err(W(diagnostic)) => scope.diagnostics.push(diagnostic),
-                    Ok(Traverse::Yes) => {
+                    Ok(true) => {
                         if cursor.goto_first_child() {
-                            doc_stack.push(std::mem::take(&mut documentation));
                             continue;
                         }
-                    },
-                    Ok(Traverse::Not) => {
-                        documentation.clear();
                     },
                     _ => {},
                 }
@@ -292,14 +292,6 @@ impl Backend {
                     if !cursor.goto_parent() {
                         run = false;
                         break;
-                    }
-                    let node = W(cursor.node());
-                    let doc = doc_stack
-                        .pop()
-                        .ok_or_else(|| scope.diagnostics.push(node.error("internal: docs stack drained").0))
-                        .unwrap_or_default();
-                    if let Err(W(diagnostic)) = self.exit_node(&url, &mut scope, node, doc) {
-                        scope.diagnostics.push(diagnostic)
                     }
                 }
             }
@@ -310,11 +302,67 @@ impl Backend {
             }
             drop(cursor);
             scope.tree = tree;
-            self.on_semantics_change(url, scope).await
+            self.parse(url, scope).await
         }.boxed()
     }
 
-    async fn on_semantics_change(&self, url: Url, scope: Scope) -> Result<()> {
+    async fn parse(&self, url: Url, mut scope: Scope) -> Result<()> {
+        self.client.log_message(MessageType::LOG, format!("parsing {}", url)).await;
+        if scope.faulty_ranges.is_empty() {
+            return self.analyse(url, scope).await;
+        }
+        let mut parser = self.parsers.get().await?;
+        let range = scope.tree.root_node().range();
+        let truthy_ranges = W(range).complement(scope.faulty_ranges.clone());
+        parser.set_included_ranges(truthy_ranges.as_slice()).map_err(|_| Error::Parse)?;
+        scope.tree = parser.parse(scope.content.as_bytes(), None).ok_or(Error::Parse)?;
+        parser.set_included_ranges(&[]).map_err(|_| Error::Parse)?;
+        self.analyse(url, scope).await
+    }
+
+    async fn analyse(&self, url: Url, mut scope: Scope) -> Result<()> {
+        self.client.log_message(MessageType::LOG, format!("analysing {}", url)).await;
+        let tree = std::mem::replace(&mut scope.tree, NULL.get().cloned().expect("no NULL tree"));
+        let mut cursor = tree.walk();
+        let mut doc_stack = vec![];
+        let mut run = true;
+        let mut documentation = String::new();
+        while run {
+            let traverse = self.enter_node(&url, &mut scope, cursor.node().into(), &mut documentation).await;
+            match traverse {
+                Err(W(diagnostic)) => scope.diagnostics.push(diagnostic),
+                Ok(Traverse::Yes) => {
+                    if cursor.goto_first_child() {
+                        doc_stack.push(std::mem::take(&mut documentation));
+                        continue;
+                    }
+                },
+                Ok(Traverse::Not) => {
+                    documentation.clear();
+                },
+                _ => {},
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    run = false;
+                    break;
+                }
+                let node = W(cursor.node());
+                let doc = doc_stack
+                    .pop()
+                    .ok_or_else(|| scope.diagnostics.push(node.error("internal: docs stack drained").0))
+                    .unwrap_or_default();
+                if let Err(W(diagnostic)) = self.exit_node(&url, &mut scope, node, doc) {
+                    scope.diagnostics.push(diagnostic)
+                }
+            }
+        }
+        drop(cursor);
+        scope.tree = tree;
+        self.update(url, scope).await
+    }
+
+    async fn update(&self, url: Url, scope: Scope) -> Result<()> {
         self.client.log_message(MessageType::LOG, format!("updating diagnostics {}", url)).await;
         self.client.publish_diagnostics(
             url.clone(),
@@ -329,7 +377,7 @@ impl Backend {
         let _ = join_all(
             items
                 .into_iter()
-                .map(|(reference, scope)| self.on_tree_change(reference, scope.version, scope.content, scope.tree))
+                .map(|(reference, scope)| self.preprocess(reference, scope.version, scope.content, scope.tree))
         ).await;
         if should_refresh {
             self.client.log_message(MessageType::LOG, format!("refreshing semantic tokens {}", url)).await;
@@ -406,11 +454,8 @@ impl Backend {
         Some(result)
     }
 
-    async fn enter_node<'tree>(&self, url: &Url, scope: &mut Scope, node: W<Node<'tree>>, if_stack: &mut IfStack<'tree>, documentation: &mut String) -> std::result::Result<Traverse, W<Diagnostic>> {
-        if !node.is_named() {
-            return Ok(Traverse::Comment);
-        }
-        let mut traverse = Traverse::Not;
+    async fn preprocessor_enter_node<'tree>(&self, url: &Url, scope: &mut Scope, node: W<Node<'tree>>, if_stack: &mut IfStack<'tree>, documentation: &mut String) -> std::result::Result<bool, W<Diagnostic>> {
+        let mut traverse = false;
         match node.kind() {
             "if" => {
                 let condition = node.expect("condition")?;
@@ -439,12 +484,18 @@ impl Backend {
                 }
             },
             "endif" => {
-                let last = if_stack.last().ok_or_else(|| node.error("expected #if"))?;
+                let last = if_stack.pop().ok_or_else(|| node.error("expected #if"))?;
                 if let Some((start, end)) = match last {
                     (true, _, None) => None,
                     (true, _, Some(n_else)) => Some((n_else, node)),
                     (false, n_if, n_else) => Some((n_if, n_else.unwrap_or(node))),
                 } {
+                    scope.faulty_ranges.push(tree_sitter::Range {
+                        start_byte: start.end_byte(),
+                        end_byte: end.start_byte(),
+                        start_point: start.end_position(),
+                        end_point: end.start_position(),
+                    });
                     scope.semantic_tokens.extend(
                         (start.end_position().row + 1..end.start_position().row)
                             .map(|line| SemanticToken {
@@ -456,13 +507,11 @@ impl Backend {
                             })
                     );
                 }
-                if_stack.pop();
             },
             _ => {},
         }
         let skip = if_stack.last().map(|(if_condition, _, n_else)| *if_condition != n_else.is_none()).unwrap_or_default();
         if skip {
-            documentation.clear();
             return Ok(traverse);
         }
         match node.kind() {
@@ -479,7 +528,7 @@ impl Backend {
             "include" => {
                 let filename = node.expect("filename")?.expect("double_quoted")?;
                 let file_url = self.find_file(url, scope, filename)?;
-                self.on_file_open(file_url.clone()).await.map_err(|_| filename.error("could not read file"))?;
+                self.open_file(file_url.clone()).await.map_err(|_| filename.error("could not read file"))?;
                 if let Some(file_scope) = self.files.get(&file_url) {
                     scope.definitions.extend(file_scope.definitions.clone());
                 }
@@ -490,12 +539,30 @@ impl Backend {
             },
             "once" => { scope.once = true; },
             "unknown" => { Err(node.error("unknown directive"))? },
+            "comment" => {
+                let text = node.text(scope.content.as_bytes())?;
+                *documentation += text.get(2..).unwrap_or_default();
+                documentation.push('\n');
+                return Ok(false);
+            },
+            _ => {
+                traverse = true;
+            },
+        }
+        documentation.clear();
+        Ok(traverse)
+    }
+
+    async fn enter_node<'tree>(&self, _: &Url, scope: &mut Scope, node: W<Node<'tree>>, documentation: &mut String) -> std::result::Result<Traverse, W<Diagnostic>> {
+        let mut traverse = Traverse::Not;
+        match node.kind() {
+            "if" | "else" | "endif" | "define" | "import" | "undef" | "include" | "once" | "unknown" => {},
             "ERROR" => { Err(node.error("syntax"))? },
             "comment" => {
                 let text = node.text(scope.content.as_bytes())?;
                 *documentation += text.get(2..).unwrap_or_default();
                 documentation.push('\n');
-                traverse = Traverse::Comment;
+                return Ok(Traverse::Comment);
             },
             _ => {
                 traverse = Traverse::Yes;
@@ -786,7 +853,7 @@ impl LanguageServer for Backend {
     async fn initialize(&self, _: InitializeParams) -> jsonrpc::Result<InitializeResult> {
         trace!("initialize");
         for (url, content) in self.builtins.iter() {
-            let _ = self.on_file_update(url.clone(), 0, content.clone()).await;
+            let _ = self.read_file(url.clone(), 0, content.clone()).await;
         }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -847,7 +914,7 @@ impl LanguageServer for Backend {
         if document.language_id != "fastbuild" {
             return;
         }
-        self.on_file_update(
+        self.read_file(
             document.uri,
             document.version,
             document.text,
@@ -861,7 +928,7 @@ impl LanguageServer for Backend {
             warn!("file changes: {:?}", params.content_changes);
             return;
         }
-        let _ = self.on_file_update(
+        let _ = self.read_file(
             document.uri,
             document.version,
             std::mem::take(&mut params.content_changes[0].text),
@@ -1126,7 +1193,7 @@ mod tests {
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
         assert_eq!(diagnostic.message, "expected #if");
         assert_eq!(diagnostic.range.start.line, 0);
-        assert_eq!(diagnostic.range.start.character, 1);
+        assert_eq!(diagnostic.range.start.character, 0);
         assert_eq!(diagnostic.range.end.line, 0);
         assert_eq!(diagnostic.range.end.character, 5);
     }
@@ -1140,7 +1207,7 @@ mod tests {
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
         assert_eq!(diagnostic.message, "expected #endif");
         assert_eq!(diagnostic.range.start.line, 0);
-        assert_eq!(diagnostic.range.start.character, 1);
+        assert_eq!(diagnostic.range.start.character, 0);
         assert_eq!(diagnostic.range.end.line, 0);
         assert_eq!(diagnostic.range.end.character, 5);
     }
@@ -1154,7 +1221,7 @@ mod tests {
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
         assert_eq!(diagnostic.message, "unknown directive");
         assert_eq!(diagnostic.range.start.line, 0);
-        assert_eq!(diagnostic.range.start.character, 1);
+        assert_eq!(diagnostic.range.start.character, 0);
         assert_eq!(diagnostic.range.end.line, 0);
         assert_eq!(diagnostic.range.end.character, 8);
     }
@@ -1469,6 +1536,23 @@ mod tests {
             token_type: 0,
             token_modifiers_bitset: 0,
         }]);
+    }
+
+    #[tokio::test]
+    async fn preprocessor_in_name() {
+        let (uri, service) = make_with_file("memory:///nested_preprocessor.bff", "function\n#if 0\nA\n#else\nB\n#endif\n() {}").await;
+        let backend = service.inner();
+        let scope = backend.files.get(&uri).expect("no file");
+        assert_eq!(scope.diagnostics, Vec::new());
+        assert_eq!(scope.semantic_tokens, vec![SemanticToken {
+            delta_start: 0,
+            delta_line: 2,
+            length: u32::max_value(),
+            token_type: 0,
+            token_modifiers_bitset: 0,
+        }]);
+        let symbol = scope.definitions.get("B").expect("wrong symbol name");
+        assert_eq!(symbol.value, Some(Value::Function));
     }
 
 }
