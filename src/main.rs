@@ -276,7 +276,7 @@ impl Backend {
             while run {
                 let traverse = self.enter_node(&url, &mut scope, cursor.node().into(), &mut if_stack, &mut documentation).await;
                 match traverse {
-                    Err(diagnostic) => scope.diagnostics.push(diagnostic.0),
+                    Err(W(diagnostic)) => scope.diagnostics.push(diagnostic),
                     Ok(Traverse::Yes) => {
                         if cursor.goto_first_child() {
                             doc_stack.push(std::mem::take(&mut documentation));
@@ -298,7 +298,9 @@ impl Backend {
                         .pop()
                         .ok_or_else(|| scope.diagnostics.push(node.error("internal: docs stack drained").0))
                         .unwrap_or_default();
-                    let _ = self.exit_node(&url, &mut scope, node, doc);
+                    if let Err(W(diagnostic)) = self.exit_node(&url, &mut scope, node, doc) {
+                        scope.diagnostics.push(diagnostic)
+                    }
                 }
             }
             for (_, n_if, n_else) in if_stack {
@@ -464,6 +466,7 @@ impl Backend {
             return Ok(traverse);
         }
         match node.kind() {
+            "if" | "else" | "endif" => {},
             "define" => {
                 scope.define(url, node.expect("variable")?, std::mem::take(documentation), Value::Macro(true))?;
             },
@@ -506,7 +509,7 @@ impl Backend {
             "function_definition" => {
                 scope.define(url, node.expect("name")?, documentation, Value::Function)?;
             },
-            "function_call" => {
+            "call" => {
                 scope.reference(url, node.expect("name")?)?;
             },
             "compound" => {
@@ -517,9 +520,6 @@ impl Backend {
                     documentation,
                     value
                 )?;
-            },
-            "usage" => {
-                scope.reference(url, node.expect("variable")?)?;
             },
             _ => {
             },
