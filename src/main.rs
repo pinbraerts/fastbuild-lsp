@@ -387,54 +387,11 @@ impl Backend {
     }
 
     async fn enter_node<'tree>(&self, url: &Url, scope: &mut Scope, node: W<Node<'tree>>, if_stack: &mut IfStack<'tree>, documentation: &mut String) -> std::result::Result<bool, W<Diagnostic>> {
-        let skip = if_stack.last().map(|(if_condition, _, n_else)| *if_condition != n_else.is_none()).unwrap_or_default();
         if !node.is_named() {
             return Ok(false);
         }
         let mut traverse = false;
         match node.kind() {
-            "function_definition" => if !skip {
-                scope.define(url, node.expect("name")?, std::mem::take(documentation), Value::Function)?;
-            },
-            "function_call" => if !skip {
-                scope.reference(url, node.expect("name")?)?;
-            },
-            "compound" => if !skip {
-                let variable = node.expect("left")?.expect("variable")?;
-                let value = self.parse_expression(url, scope, node.get(1)?.expect("right")?)?;
-                scope.define_or_reference(url,
-                    variable,
-                    std::mem::take(documentation),
-                    value
-                )?;
-            },
-            "usage" => if !skip {
-                scope.reference(url, node.expect("variable")?)?;
-            },
-            "define" => if !skip {
-                scope.define(url, node.expect("variable")?, std::mem::take(documentation), Value::Macro(true))?;
-            },
-            "import" => if !skip {
-                scope.find_env_variable(node.expect("variable")?)?;
-            },
-            "undef" => if !skip {
-                scope.undefine(url, node.expect("variable")?)?;
-            },
-            "include" => if !skip {
-                let filename = node.expect("filename")?.expect("double_quoted")?;
-                let file_url = self.find_file(url, scope, filename)?;
-                self.on_file_open(file_url.clone()).await.map_err(|_| filename.error("could not read file"))?;
-                if let Some(file_scope) = self.files.get(&file_url) {
-                    scope.definitions.extend(file_scope.definitions.clone());
-                }
-                else {
-                    Err(filename.error("error while processing file"))?;
-                }
-                scope.references.insert(file_url.clone());
-            },
-            "once" => if !skip { scope.once = true; },
-            "unknown" => if !skip { Err(node.error("unknown directive"))? },
-            "ERROR" => if !skip { Err(node.error("syntax"))? },
             "if" => {
                 let condition = node.expect("condition")?;
                 let result = match self.preprocess_expression(url, scope, condition) {
@@ -481,6 +438,56 @@ impl Backend {
                 }
                 if_stack.pop();
             },
+            _ => {},
+        }
+        let skip = if_stack.last().map(|(if_condition, _, n_else)| *if_condition != n_else.is_none()).unwrap_or_default();
+        if skip {
+            documentation.clear();
+            return Ok(traverse);
+        }
+        match node.kind() {
+            "function_definition" => {
+                scope.define(url, node.expect("name")?, std::mem::take(documentation), Value::Function)?;
+            },
+            "function_call" => {
+                scope.reference(url, node.expect("name")?)?;
+            },
+            "compound" => {
+                let variable = node.expect("left")?.expect("variable")?;
+                let value = self.parse_expression(url, scope, node.get(1)?.expect("right")?)?;
+                scope.define_or_reference(url,
+                    variable,
+                    std::mem::take(documentation),
+                    value
+                )?;
+            },
+            "usage" => {
+                scope.reference(url, node.expect("variable")?)?;
+            },
+            "define" => {
+                scope.define(url, node.expect("variable")?, std::mem::take(documentation), Value::Macro(true))?;
+            },
+            "import" => {
+                scope.find_env_variable(node.expect("variable")?)?;
+            },
+            "undef" => {
+                scope.undefine(url, node.expect("variable")?)?;
+            },
+            "include" => {
+                let filename = node.expect("filename")?.expect("double_quoted")?;
+                let file_url = self.find_file(url, scope, filename)?;
+                self.on_file_open(file_url.clone()).await.map_err(|_| filename.error("could not read file"))?;
+                if let Some(file_scope) = self.files.get(&file_url) {
+                    scope.definitions.extend(file_scope.definitions.clone());
+                }
+                else {
+                    Err(filename.error("error while processing file"))?;
+                }
+                scope.references.insert(file_url.clone());
+            },
+            "once" => { scope.once = true; },
+            "unknown" => { Err(node.error("unknown directive"))? },
+            "ERROR" => { Err(node.error("syntax"))? },
             "comment" => {
                 let text = node.text(scope.content.as_bytes())?;
                 *documentation += text.get(2..).unwrap_or_default();
