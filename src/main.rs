@@ -15,7 +15,7 @@ use tree_sitter::{Node, Parser, Point, Tree};
 use tokio::fs::File;
 
 use std::collections::{HashMap, HashSet};
-use std::env::VarError::NotPresent;
+use std::env::VarError::{NotPresent, NotUnicode};
 use parser_pool::ParserPool;
 use tower_lsp::{jsonrpc, lsp_types::*};
 use tower_lsp::{Client, LanguageServer, Server, LspService};
@@ -201,11 +201,12 @@ impl Scope {
         Ok(self.definitions.entry(name.into()).or_default().define_or_reference(url, node, documentation, value))
     }
 
-    fn find_env_variable(&self, node: W<Node>) -> std::result::Result<(), W<Diagnostic>> {
+    fn find_env_variable(&self, node: W<Node>) -> std::result::Result<Value, W<Diagnostic>> {
         let name = node.text(self.content.as_bytes())?;
         match std::env::var(name) {
             Err(NotPresent) => Err(node.error("environment variable not found")),
-            _ => Ok(()),
+            Err(NotUnicode(_)) => Err(node.error("not unicode")),
+            Ok(s) => Ok(Value::String(s)),
         }
     }
 
@@ -243,55 +244,55 @@ impl Backend {
         self.on_text_change(url, version, content).await
     }
 
-    fn on_text_change(&self, url: Url, version: i32, content: String) -> BoxFuture<Result<()>> {
-        async move {
-            self.client.log_message(MessageType::LOG, format!("parsing {}", url)).await;
-            let tree = self.parse(content.as_bytes()).await?;
-            self.on_tree_change(url, version, content, tree).await
-        }.boxed()
+    async fn on_text_change(&self, url: Url, version: i32, content: String) -> Result<()> {
+        self.client.log_message(MessageType::LOG, format!("parsing {}", url)).await;
+        let tree = self.parse(content.as_bytes()).await?;
+        self.on_tree_change(url, version, content, tree).await
     }
 
-    async fn on_tree_change(&self, url: Url, version: i32, content: String, tree: Tree) -> Result<()> {
-        self.client.log_message(MessageType::LOG, format!("analysing {}", url)).await;
-        let mut cursor = tree.walk();
-        let mut if_stack = vec![];
-        let mut run = true;
-        let mut scope = Scope::new(version, content);
-        if !self.builtins.contains_key(&url) {
-            for (builtin_url, _) in self.builtins.iter() {
-                if let Some(file_scope) = self.files.get(builtin_url) {
-                    scope.definitions.extend(file_scope.definitions.clone());
-                    scope.references.insert(builtin_url.clone());
-                }
-            }
-        }
-        let mut documentation = String::new();
-        while run {
-            let traverse = self.enter_node(&url, &mut scope, cursor.node().into(), &mut if_stack, &mut documentation).await;
-            match traverse {
-                Err(diagnostic) => scope.diagnostics.push(diagnostic.0),
-                Ok(true) => {
-                    if cursor.goto_first_child() {
-                        continue;
+    fn on_tree_change(&self, url: Url, version: i32, content: String, tree: Tree) -> BoxFuture<Result<()>> {
+        async move {
+            self.client.log_message(MessageType::LOG, format!("analysing {}", url)).await;
+            let mut cursor = tree.walk();
+            let mut if_stack = vec![];
+            let mut run = true;
+            let mut scope = Scope::new(version, content);
+            if !self.builtins.contains_key(&url) {
+                for (builtin_url, _) in self.builtins.iter() {
+                    if let Some(file_scope) = self.files.get(builtin_url) {
+                        scope.definitions.extend(file_scope.definitions.clone());
+                        scope.references.insert(builtin_url.clone());
                     }
-                },
-                _ => {},
-            }
-            while !cursor.goto_next_sibling() {
-                if !cursor.goto_parent() {
-                    run = false;
-                    break;
                 }
             }
-        }
-        for (_, n_if, n_else) in if_stack {
-            scope.diagnostics.push(n_if.error("expected #endif").with(
-                n_else.map(|e| e.related(&url, "#else here"))
-            ).0);
-        }
-        drop(cursor);
-        scope.tree = tree;
-        self.on_semantics_change(url, scope).await
+            let mut documentation = String::new();
+            while run {
+                let traverse = self.enter_node(&url, &mut scope, cursor.node().into(), &mut if_stack, &mut documentation).await;
+                match traverse {
+                    Err(diagnostic) => scope.diagnostics.push(diagnostic.0),
+                    Ok(true) => {
+                        if cursor.goto_first_child() {
+                            continue;
+                        }
+                    },
+                    _ => {},
+                }
+                while !cursor.goto_next_sibling() {
+                    if !cursor.goto_parent() {
+                        run = false;
+                        break;
+                    }
+                }
+            }
+            for (_, n_if, n_else) in if_stack {
+                scope.diagnostics.push(n_if.error("expected #endif").with(
+                    n_else.map(|e| e.related(&url, "#else here"))
+                ).0);
+            }
+            drop(cursor);
+            scope.tree = tree;
+            self.on_semantics_change(url, scope).await
+        }.boxed()
     }
 
     async fn on_semantics_change(&self, url: Url, scope: Scope) -> Result<()> {
@@ -309,7 +310,7 @@ impl Backend {
         let _ = join_all(
             items
                 .into_iter()
-                .map(|(reference, scope)| self.on_text_change(reference, scope.version, scope.content))
+                .map(|(reference, scope)| self.on_tree_change(reference, scope.version, scope.content, scope.tree))
         ).await;
         if should_refresh {
             self.client.log_message(MessageType::LOG, format!("refreshing semantic tokens {}", url)).await;
@@ -347,7 +348,7 @@ impl Backend {
             "call" => {
                 let argument = node.expect("arguments")?;
                 match node.expect("name")?.text(scope.content.as_bytes())? {
-                    "exists" => scope.find_env_variable(argument),
+                    "exists" => scope.find_env_variable(argument).map(|_| ()),
                     "file_exists" => self.find_file(url, scope, argument.expect("double_quoted")?).and(Ok(())),
                     _ => Err(node.error("unknown macro function")),
                 }.and(Ok(true))?
@@ -540,7 +541,7 @@ impl Backend {
             "call" => {
                 let argument = node.expect("arguments")?;
                 match node.expect("name")?.text(scope.content.as_bytes())? {
-                    "exists" => scope.find_env_variable(argument),
+                    "exists" => scope.find_env_variable(argument).map(|_| ()),
                     "file_exists" => self.find_file(url, scope, argument.expect("double_quoted")?).and(Ok(())),
                     _ => Err(node.error("unknown function")),
                 }.and(Ok(Value::Macro(true)))?
