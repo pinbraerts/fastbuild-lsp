@@ -328,7 +328,7 @@ impl Backend {
         let mut run = true;
         let mut documentation = String::new();
         while run {
-            let traverse = self.enter_node(&url, &mut scope, cursor.node().into(), &mut documentation).await;
+            let traverse = self.enter_node(&url, &mut scope, cursor.node().into(), &mut documentation);
             match traverse {
                 Err(W(diagnostic)) => scope.diagnostics.push(diagnostic),
                 Ok(Traverse::Yes) => {
@@ -553,8 +553,8 @@ impl Backend {
         Ok(traverse)
     }
 
-    async fn enter_node<'tree>(&self, _: &Url, scope: &mut Scope, node: W<Node<'tree>>, documentation: &mut String) -> std::result::Result<Traverse, W<Diagnostic>> {
-        let mut traverse = Traverse::Not;
+    fn enter_node<'tree>(&self, url: &Url, scope: &mut Scope, node: W<Node<'tree>>, documentation: &mut String) -> std::result::Result<bool, W<Diagnostic>> {
+        let mut traverse = false;
         match node.kind() {
             "if" | "else" | "endif" | "define" | "import" | "undef" | "include" | "once" | "unknown" => {},
             "ERROR" => { Err(node.error("syntax"))? },
