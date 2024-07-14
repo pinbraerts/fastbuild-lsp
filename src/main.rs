@@ -35,6 +35,18 @@ enum Value {
     Identifier(String),
 }
 
+impl Value {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Bool(_) => "Bool",
+            Self::String(_) => "String",
+            Self::Number(_) => "Number",
+            Self::Function => "Function",
+            Self::Identifier(_) => "Identifier",
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Usage {
     Local(String),
@@ -647,7 +659,7 @@ impl Backend {
                                 (Some(Value::String(a)), Value::String(b)) => Ok(Value::String(a + &b)),
                                 (Some(Value::Number(a)), Value::Number(b)) => Ok(Value::Number(a + b)),
                                 (Some(Value::String(a)), Value::Number(b)) => Ok(Value::String(a + &b.to_string())),
-                                _ => Err(n.error("concatenation is unsupported between this types")),
+                                (Some(a), b) => Err(n.error(format!("concatenation is unsupported between {} and {}", a.kind(), b.kind()))),
                             }
                         },
                         Syntax::Subtract(e) => {
@@ -662,7 +674,7 @@ impl Backend {
                                     }
                                 )),
                                 (Some(Value::Number(a)), Value::Number(b)) => Ok(Value::Number(a - b)),
-                                _ => Err(n.error("subtraction is unsupported between this types")),
+                                (Some(a), b) => Err(n.error(format!("subtraction is unsupported between {} and {}", a.kind(), b.kind()))),
                             }
                         },
                         _ => Err(n.error("unexpected")),
@@ -1640,7 +1652,7 @@ mod tests {
         let (_, scope) = make_file("memory:///wrong_typing.bff", ".A = 3\n- 'a'").await;
         assert_eq!(scope.semantic_tokens, Vec::new());
         let diagnostic = scope.diagnostics.first().expect("no diagnostics");
-        assert_eq!(diagnostic.message, "subtraction is unsupported between this types");
+        assert_eq!(diagnostic.message, "subtraction is unsupported between Number and String");
         assert_eq!(diagnostic.range.start, Position::new(1, 0));
         assert_eq!(diagnostic.range.end, Position::new(1, 5));
     }
