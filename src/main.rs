@@ -364,14 +364,15 @@ impl Backend {
         let mut run = true;
         let mut documentation = String::new();
         while run {
-            match self.enter_node(&url, &mut scope, cursor.node().into(), &mut documentation) {
+            let node = W(cursor.node());
+            match self.enter_node(&url, &mut scope, node, &mut documentation) {
                 Err(W(diagnostic)) => { scope.diagnostics.push(diagnostic); },
                 Ok(Some(value)) => if let Some(last) = stack.last_mut() {
                     if let Some(name) = cursor.field_name() {
-                        last.named.insert(name.into(), (W(cursor.node()), Syntax::Value(value)));
+                        last.named.insert(name.into(), (node, Syntax::Value(value)));
                     }
                     else {
-                        last.unnamed.push((W(cursor.node()), Syntax::Value(value)));
+                        last.unnamed.push((node, Syntax::Value(value)));
                     }
                 },
                 _ => {},
