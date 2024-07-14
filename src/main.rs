@@ -1040,6 +1040,21 @@ mod tests {
         (uri, service)
     }
 
+    async fn make_file(uri: &str, content: &str) -> (Url, Scope) {
+        let uri = Url::parse(uri).expect("failed to parse url");
+        let service = make().await;
+        let backend = service.inner();
+        backend.did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "fastbuild".into(),
+                version: 0,
+                text: content.into(),
+            },
+        }).await;
+        (uri.clone(), service.inner().files.remove(&uri).expect("no file").1)
+    }
+
     async fn make_with_files(files: Vec<(&str, &str)>) -> (Vec<Url>, LspService<Backend>) {
         let service = make().await;
         let backend = service.inner();
@@ -1061,9 +1076,7 @@ mod tests {
 
     #[tokio::test]
     async fn syntax_error() {
-        let (uri, service) = make_with_file("memory:///syntax_error.bff", "=").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///syntax_error.bff", "=").await;
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
         assert_eq!(diagnostic.message, "syntax");
         assert_eq!(scope.semantic_tokens, Vec::new());
@@ -1071,9 +1084,7 @@ mod tests {
 
     #[tokio::test]
     async fn redefinition() {
-        let (uri, service) = make_with_file("memory:///redefinition.bff", "#define A\n#define A").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (uri, scope) = make_file("memory:///redefinition.bff", "#define A\n#define A").await;
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
         assert_eq!(scope.semantic_tokens, Vec::new());
         assert_eq!(diagnostic.message, "macro redefinition");
@@ -1087,9 +1098,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_not_found() {
-        let (uri, service) = make_with_file("memory:///import_not_found.bff", "#import __SURELYNOSUCHENVVAR").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///import_not_found.bff", "#import __SURELYNOSUCHENVVAR").await;
         assert_eq!(scope.semantic_tokens, Vec::new());
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
         assert_eq!(diagnostic.message, "environment variable not found");
@@ -1101,18 +1110,14 @@ mod tests {
 
     #[tokio::test]
     async fn undef() {
-        let (uri, service) = make_with_file("memory:///undefine.bff", "#define A\n#undef A").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///undefine.bff", "#define A\n#undef A").await;
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
     }
 
     #[tokio::test]
     async fn undef_undefined() {
-        let (uri, service) = make_with_file("memory:///undefined.bff", "#undef A").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///undefined.bff", "#undef A").await;
         assert_eq!(scope.semantic_tokens, Vec::new());
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
         assert_eq!(diagnostic.message, "trying to undefine undefined macro");
@@ -1124,18 +1129,14 @@ mod tests {
 
     #[tokio::test]
     async fn import() {
-        let (uri, service) = make_with_file("memory:///import.bff", "#import PATH").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///import.bff", "#import PATH").await;
         assert_eq!(scope.diagnostics, vec!());
         assert_eq!(scope.semantic_tokens, Vec::new());
     }
 
     #[tokio::test]
     async fn once() {
-        let (uri, service) = make_with_file("memory:///once.bff", "#once").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///once.bff", "#once").await;
         assert!(scope.once);
         assert_eq!(scope.semantic_tokens, Vec::new());
         assert_eq!(scope.diagnostics, Vec::new());
@@ -1143,9 +1144,7 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_if() {
-        let (uri, service) = make_with_file("memory:///preprocessor_if.bff", "#if 1\n.A = 3\n#else\n.B = 4\n#endif").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///preprocessor_if.bff", "#if 1\n.A = 3\n#else\n.B = 4\n#endif").await;
         assert_eq!(scope.diagnostics, Vec::new());
         let token = scope.semantic_tokens.first().expect("no semantic tokens");
         assert_eq!(token.delta_line, 3);
@@ -1157,9 +1156,7 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_else() {
-        let (uri, service) = make_with_file("memory:///preprocessor_else.bff", "#if 0\n.A = 3\n#else\n.B = 4\n#endif").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///preprocessor_else.bff", "#if 0\n.A = 3\n#else\n.B = 4\n#endif").await;
         assert_eq!(scope.diagnostics, Vec::new());
         let token = scope.semantic_tokens.first().expect("no semantic tokens");
         assert_eq!(token.delta_line, 1, "mismatching lines");
@@ -1171,9 +1168,7 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_if_evaluation() {
-        let (uri, service) = make_with_file("memory:///preprocessor_if_missing.bff", "#define A\n#if 1\n#undef A\n\n#endif\n#if A\n.A = 3\n#endif").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///preprocessor_if_missing.bff", "#define A\n#if 1\n#undef A\n\n#endif\n#if A\n.A = 3\n#endif").await;
         assert_eq!(scope.diagnostics, Vec::new());
         let token = scope.semantic_tokens.first().expect("no semantic tokens");
         assert_eq!(scope.diagnostics, vec![]);
@@ -1186,9 +1181,7 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_if_missing() {
-        let (uri, service) = make_with_file("memory:///preprocessor_if_missing.bff", "#else").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///preprocessor_if_missing.bff", "#else").await;
         assert_eq!(scope.semantic_tokens, Vec::new());
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
         assert_eq!(diagnostic.message, "expected #if");
@@ -1200,9 +1193,7 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_endif_missing() {
-        let (uri, service) = make_with_file("memory:///preprocessor_if_missing.bff", "#if 1").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///preprocessor_if_missing.bff", "#if 1").await;
         assert_eq!(scope.semantic_tokens, Vec::new());
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
         assert_eq!(diagnostic.message, "expected #endif");
@@ -1214,9 +1205,7 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_unknown() {
-        let (uri, service) = make_with_file("memory:///preprocessor_unknown.bff", "#unknown").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///preprocessor_unknown.bff", "#unknown").await;
         assert_eq!(scope.semantic_tokens, Vec::new());
         let diagnostic = scope.diagnostics.first().expect("no diagnostic");
         assert_eq!(diagnostic.message, "unknown directive");
@@ -1228,18 +1217,14 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_include() {
-        let (uri, service) = make_with_file("memory:///builtins/preprocessor_include.bff", "#include \"alias.bff\"").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///builtins/preprocessor_include.bff", "#include \"alias.bff\"").await;
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
     }
 
     #[tokio::test]
     async fn preprocessor_if_file_exists() {
-        let (uri, service) = make_with_file("memory:///builtins/preprocessor_if_file_exists.bff", "#if file_exists(\"alias.bff\")\n#else\n.A = 3\n#endif").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///builtins/preprocessor_if_file_exists.bff", "#if file_exists(\"alias.bff\")\n#else\n.A = 3\n#endif").await;
         assert_eq!(scope.diagnostics, vec![]);
         assert_eq!(scope.semantic_tokens.first(), Some(&SemanticToken {
             delta_line: 2,
@@ -1252,9 +1237,7 @@ mod tests {
 
     #[tokio::test]
     async fn os() {
-        let (uri, service) = make_with_file("memory:///os.bff", "").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///os.bff", "").await;
         assert_eq!(scope.semantic_tokens, Vec::new());
         assert_eq!(scope.diagnostics, Vec::new());
         match std::env::consts::OS {
@@ -1306,9 +1289,7 @@ mod tests {
 
     #[tokio::test]
     async fn define_with_documentation() {
-        let (uri, service) = make_with_file("memory:///define_with_documentation.bff", "; documentation\n; for A\n#define A").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///define_with_documentation.bff", "; documentation\n; for A\n#define A").await;
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
         let definition = scope.definitions.get("A").expect("undefined");
@@ -1473,9 +1454,7 @@ mod tests {
 
     #[tokio::test]
     async fn function_definition() {
-        let (uri, service) = make_with_file("memory:///function_definition.bff", "; documentation\n; for A\nfunction A() {}").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///function_definition.bff", "; documentation\n; for A\nfunction A() {}").await;
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
         let definition = scope.definitions.get("A").expect("undefined");
@@ -1484,9 +1463,7 @@ mod tests {
 
     #[tokio::test]
     async fn variable_definition() {
-        let (uri, service) = make_with_file("memory:///variable_definition.bff", "; documentation\n; for A\n.A = 3").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (uri, scope) = make_file("memory:///variable_definition.bff", "; documentation\n; for A\n.A = 3").await;
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
         let definition = scope.definitions.get("A").expect("undefined");
@@ -1497,9 +1474,7 @@ mod tests {
 
     #[tokio::test]
     async fn nested_declaration() {
-        let (uri, service) = make_with_file("memory:///nested_declaration.bff", "function A() {\n; documentation\n; for B\n.B = 3\n}").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (uri, scope) = make_file("memory:///nested_declaration.bff", "function A() {\n; documentation\n; for B\n.B = 3\n}").await;
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
         let definition = scope.definitions.get("B").expect("undefined");
@@ -1510,9 +1485,7 @@ mod tests {
 
     #[tokio::test]
     async fn nested_preprocessor() {
-        let (uri, service) = make_with_file("memory:///nested_preprocessor.bff", "function A() {\n#if 1\n.B = 3\n#else\n.C = 4\n#endif\n}").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///nested_preprocessor.bff", "function A() {\n#if 1\n.B = 3\n#else\n.C = 4\n#endif\n}").await;
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, vec![SemanticToken {
             delta_start: 0,
@@ -1525,9 +1498,7 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_in_compound() {
-        let (uri, service) = make_with_file("memory:///nested_preprocessor.bff", "function A() {.B = \"B\"\n#if 1\n+ \"A\"\n#else\n- \"B\"\n#endif\n}").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///preprocessor_in_compound.bff", "function A() {.B = \"B\"\n#if 1\n+ \"A\"\n#else\n- \"B\"\n#endif\n}").await;
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, vec![SemanticToken {
             delta_start: 0,
@@ -1540,9 +1511,7 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_in_name() {
-        let (uri, service) = make_with_file("memory:///nested_preprocessor.bff", "function\n#if 0\nA\n#else\nB\n#endif\n() {}").await;
-        let backend = service.inner();
-        let scope = backend.files.get(&uri).expect("no file");
+        let (_, scope) = make_file("memory:///preprocessor_in_name.bff", "function\n#if 0\nA\n#else\nB\n#endif\n() {}").await;
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, vec![SemanticToken {
             delta_start: 0,
