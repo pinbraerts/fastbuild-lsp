@@ -25,36 +25,41 @@ use tracing::{info, trace, warn};
 
 use crate::parser_pool::new_pool;
 
-enum Traverse {
-    Not,
-    Yes,
-    Comment,
-}
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum Value {
-    Macro(bool),
+    Bool(bool),
     String(String),
     Number(i32),
     //Array,
     Function,
+    Identifier(String),
+}
+
+#[derive(Debug)]
+enum Usage {
+    Local(String),
+    Parent(String),
+}
+
+#[derive(Debug)]
+enum Syntax {
+    Usage(Usage),
+    Value(Value),
+    Assign(Value),
+    Subtract(Value),
+    Concatenate(Value),
 }
 
 impl From<&Value> for bool {
     fn from(value: &Value) -> Self {
         match value {
-            Value::Macro(v) => *v,
+            Value::Bool(v) => *v,
             Value::String(s) => !s.is_empty(),
+            Value::Identifier(s) => !s.is_empty(),
             Value::Number(n) => *n != 0,
             //Value::Array => true,
             Value::Function => true,
         }
-    }
-}
-
-impl Value {
-    fn as_bool(&self) -> bool {
-        self.into()
     }
 }
 
@@ -79,7 +84,7 @@ impl Default for Symbol {
 
 impl Symbol {
 
-    fn define(&mut self, url: &Url, node: W<Node>, documentation: String, value: Value) -> std::result::Result<(), W<Diagnostic>> {
+    fn define(&mut self, url: &Url, node: W<Node>, documentation: String, value: Value) -> std::result::Result<Value, W<Diagnostic>> {
         match &self.definition {
             Some(location) => Err(node.error(
                 "macro redefinition"
@@ -88,10 +93,10 @@ impl Symbol {
                 message: "defined here".into(),
             }]))),
             _ => {
-                self.value = Some(value);
+                self.value = Some(value.clone());
                 self.documentation = markdown(documentation);
                 self.definition = Some(node.url(url));
-                Ok(())
+                Ok(value)
             },
         }
     }
@@ -117,7 +122,7 @@ impl Symbol {
             //Some((location, Reference::Undef)) => Err(Some(location.clone())),
             Some(_) => {
                 self.references.push(node.url(url));
-                Ok(self.value.clone().unwrap_or(Value::Macro(false)))
+                Ok(self.value.clone().unwrap_or(Value::Bool(false)))
             },
             _ => Err(None),
         }.map_err(|location| node.error("accessing undefined variable")
@@ -162,6 +167,25 @@ struct Scope {
 
 type IfStack<'tree> = Vec<(bool, W<Node<'tree>>, Option<W<Node<'tree>>>)>;
 
+#[derive(Debug, Default)]
+struct Context<'tree> {
+    documentation: String,
+    named: HashMap<String, (W<Node<'tree>>, Syntax)>,
+    unnamed: Vec<(W<Node<'tree>>, Syntax)>,
+}
+
+impl<'tree> Context<'tree> {
+
+    fn new(documentation: String) -> Self {
+        Self { documentation, ..Default::default() }
+    }
+
+    fn get(&mut self, name: &str, node: W<Node<'tree>>) -> std::result::Result<(W<Node<'tree>>, Syntax), W<Diagnostic>> {
+        self.named.remove(name).ok_or_else(|| node.error(format!("expected {}", name)))
+    }
+
+}
+
 impl Default for Scope {
     fn default() -> Self {
         Self {
@@ -189,7 +213,7 @@ impl Scope {
         }
     }
 
-    fn define(&mut self, url: &Url, node: W<Node>, documentation: String, value: Value) -> std::result::Result<(), W<Diagnostic>> {
+    fn define(&mut self, url: &Url, node: W<Node>, documentation: String, value: Value) -> std::result::Result<Value, W<Diagnostic>> {
         let name = node.text(self.content.as_bytes())?;
         self.definitions.entry(name.into()).or_default().define(url, node, documentation, value)
     }
@@ -324,23 +348,25 @@ impl Backend {
         self.client.log_message(MessageType::LOG, format!("analysing {}", url)).await;
         let tree = std::mem::replace(&mut scope.tree, NULL.get().cloned().expect("no NULL tree"));
         let mut cursor = tree.walk();
-        let mut doc_stack = vec![];
+        let mut stack: Vec<Context> = Vec::new();
         let mut run = true;
         let mut documentation = String::new();
         while run {
-            let traverse = self.enter_node(&url, &mut scope, cursor.node().into(), &mut documentation);
-            match traverse {
-                Err(W(diagnostic)) => scope.diagnostics.push(diagnostic),
-                Ok(Traverse::Yes) => {
-                    if cursor.goto_first_child() {
-                        doc_stack.push(std::mem::take(&mut documentation));
-                        continue;
+            match self.enter_node(&url, &mut scope, cursor.node().into(), &mut documentation) {
+                Err(W(diagnostic)) => { scope.diagnostics.push(diagnostic); },
+                Ok(Some(value)) => if let Some(last) = stack.last_mut() {
+                    if let Some(name) = cursor.field_name() {
+                        last.named.insert(name.into(), (W(cursor.node()), Syntax::Value(value)));
+                    }
+                    else {
+                        last.unnamed.push((W(cursor.node()), Syntax::Value(value)));
                     }
                 },
-                Ok(Traverse::Not) => {
-                    documentation.clear();
-                },
                 _ => {},
+            }
+            if cursor.goto_first_child() {
+                stack.push(Context::new(std::mem::take(&mut documentation)));
+                continue;
             }
             while !cursor.goto_next_sibling() {
                 if !cursor.goto_parent() {
@@ -348,13 +374,22 @@ impl Backend {
                     break;
                 }
                 let node = W(cursor.node());
-                let doc = doc_stack
+                let context = stack
                     .pop()
                     .ok_or_else(|| scope.diagnostics.push(node.error("internal: docs stack drained").0))
                     .unwrap_or_default();
-                if let Err(W(diagnostic)) = self.exit_node(&url, &mut scope, node, doc) {
-                    scope.diagnostics.push(diagnostic)
-                }
+                match self.exit_node(&url, &mut scope, cursor.node().into(), context) {
+                    Err(W(diagnostic)) => { scope.diagnostics.push(diagnostic); },
+                    Ok(Some(value)) => if let Some(last) = stack.last_mut() {
+                        if let Some(name) = cursor.field_name() {
+                            last.named.insert(name.into(), (W(cursor.node()), value));
+                        }
+                        else {
+                            last.unnamed.push((W(cursor.node()), value));
+                        }
+                    },
+                    _ => {},
+                };
             }
         }
         drop(cursor);
@@ -395,7 +430,7 @@ impl Backend {
                 .unwrap_or_default() != 0,
             "identifier" => {
                 match scope.reference(url, node)? {
-                    Value::Macro(v) => v,
+                    Value::Bool(v) => v,
                     _ => false,
                 }
             },
@@ -517,7 +552,7 @@ impl Backend {
         match node.kind() {
             "if" | "else" | "endif" => {},
             "define" => {
-                scope.define(url, node.expect("variable")?, std::mem::take(documentation), Value::Macro(true))?;
+                scope.define(url, node.expect("variable")?, std::mem::take(documentation), Value::Bool(true))?;
             },
             "import" => {
                 scope.find_env_variable(node.expect("variable")?)?;
@@ -553,93 +588,115 @@ impl Backend {
         Ok(traverse)
     }
 
-    fn enter_node<'tree>(&self, url: &Url, scope: &mut Scope, node: W<Node<'tree>>, documentation: &mut String) -> std::result::Result<bool, W<Diagnostic>> {
-        let mut traverse = false;
-        match node.kind() {
-            "if" | "else" | "endif" | "define" | "import" | "undef" | "include" | "once" | "unknown" => {},
-            "ERROR" => { Err(node.error("syntax"))? },
+    fn enter_node(&self, _: &Url, scope: &mut Scope, node: W<Node<'_>>, documentation: &mut String) -> std::result::Result<Option<Value>, W<Diagnostic>> {
+        let value = match node.kind() {
+            "if" | "else" | "endif" | "define" | "import" | "undef" | "include" | "once" | "unknown" => { return Ok(None); },
+            "ERROR" => { return Err(node.error("syntax")); },
             "comment" => {
                 let text = node.text(scope.content.as_bytes())?;
                 *documentation += text.get(2..).unwrap_or_default();
                 documentation.push('\n');
-                return Ok(Traverse::Comment);
+                return Ok(None);
             },
-            _ => {
-                traverse = Traverse::Yes;
-            },
-        }
-        Ok(traverse)
-    }
-
-    fn exit_node(&self, url: &Url, scope: &mut Scope, node: W<Node<'_>>, documentation: String) -> std::result::Result<(), W<Diagnostic>> {
-        match node.kind() {
-            "function_definition" => {
-                scope.define(url, node.expect("name")?, documentation, Value::Function)?;
-            },
-            "call" => {
-                scope.reference(url, node.expect("name")?)?;
-            },
-            "compound" => {
-                let variable = node.expect("left")?.expect("variable")?;
-                let value = self.parse_expression(url, scope, node.get(1)?.expect("right")?)?;
-                scope.define_or_reference(url,
-                    variable,
-                    documentation,
-                    value
-                )?;
-            },
-            _ => {
-            },
-        };
-        Ok(())
-    }
-
-    fn parse_expression(&self, url: &Url, scope: &mut Scope, node: W<Node<'_>>) -> std::result::Result<Value, W<Diagnostic>> {
-        Ok(match node.kind() {
-            "string" => Value::String(node.text(scope.content.as_bytes())?.into()),
+            "string" => Value::String(node.expect("double_quoted").or(node.expect("single_quoted"))?.text(scope.content.as_bytes())?.into()),
             "decimal" => Value::Number(node
                 .text(scope.content.as_bytes())?
                 .parse::<i32>()
                 .unwrap_or_default()),
-            "identifier" => scope.reference(url, node)?,
-            "not" => {
-                let value = self.parse_expression(url, scope, node.expect("right")?)?;
-                if value.as_bool() {
-                    Value::Macro(false)
-                }
-                else {
-                    value
-                }
-            },
-            "and" => {
-                let left = self.parse_expression(url, scope, node.expect("left")?)?;
-                if !left.as_bool() {
-                    Value::Macro(false)
-                }
-                else {
-                    self.parse_expression(url, scope, node.expect("right")?)?
-                }
-            },
-            "or" => {
-                let left = self.parse_expression(url, scope, node.expect("left")?)?;
-                if left.as_bool() {
-                    left
-                }
-                else {
-                    self.parse_expression(url, scope, node.expect("right")?)?
-                }
-            },
-            "call" => {
-                let argument = node.expect("arguments")?;
-                match node.expect("name")?.text(scope.content.as_bytes())? {
-                    "exists" => scope.find_env_variable(argument).map(|_| ()),
-                    "file_exists" => self.find_file(url, scope, argument.expect("double_quoted")?).and(Ok(())),
-                    _ => Err(node.error("unknown function")),
-                }.and(Ok(Value::Macro(true)))?
-            },
+            "boolean" => Value::Bool(node.text(scope.content.as_bytes())? == "true"),
+            "identifier" => Value::Identifier(node.text(scope.content.as_bytes())?.into()),
             _ => {
-                return Err(node.error("unknown expression"));
+                return Ok(None);
             }
+        };
+        documentation.clear();
+        Ok(Some(value))
+    }
+
+    fn exit_node<'tree>(&self, url: &Url, scope: &mut Scope, node: W<Node<'tree>>, mut context: Context<'tree>) -> std::result::Result<Option<Syntax>, W<Diagnostic>> {
+        Ok(Some(match node.kind() {
+            "usage" => {
+                let name = match context.get("variable", node)?.1 {
+                    Syntax::Value(Value::Identifier(s)) => s,
+                    Syntax::Value(Value::String(s)) => s,
+                    _ => Err(node.error("unexpected type"))?,
+                };
+                let scope = node.expect("scope")?;
+                Syntax::Usage(match scope.kind() {
+                    "." => Usage::Local(name),
+                    "^" => Usage::Parent(name),
+                    _ => Err(scope.error("unexpected scope"))?,
+                })
+            },
+            "assign" => Syntax::Assign(self.resolve(url, scope, node, context.get("right", node)?.1)?),
+            "subtract" => Syntax::Subtract(self.resolve(url, scope, node, context.get("right", node)?.1)?),
+            "concatenate" => Syntax::Concatenate(self.resolve(url, scope, node, context.get("right", node)?.1)?),
+            "compound" => {
+                let (left, name) = context.get("left", node)?;
+                let name = match name {
+                    Syntax::Usage(Usage::Local(name)) | Syntax::Usage(Usage::Parent(name)) => name,
+                    _ => Err(node.error("expected usage"))?,
+                };
+                let mut value = scope.definitions.get(&name).and_then(|x| x.value.clone());
+                for (n, child) in context.unnamed {
+                    let result = match child {
+                        Syntax::Assign(e) => Ok(e),
+                        Syntax::Concatenate(e) => {
+                            match (value.clone(), e) {
+                                (None, e) => Ok(e),
+                                (Some(Value::String(a)), Value::String(b)) => Ok(Value::String(a + &b)),
+                                (Some(Value::Number(a)), Value::Number(b)) => Ok(Value::Number(a + b)),
+                                (Some(Value::String(a)), Value::Number(b)) => Ok(Value::String(a + &b.to_string())),
+                                _ => Err(n.error("concatenation is unsupported between this types")),
+                            }
+                        },
+                        Syntax::Subtract(e) => {
+                            match (value.clone(), e) {
+                                (None, e) => Ok(e),
+                                (Some(Value::String(a)), Value::String(b)) => Ok(Value::String(
+                                    if let Some(index) = a.find(&b) {
+                                        a.get(0..index).unwrap_or_default().to_owned() + a.get(index + b.len()..a.len()).unwrap_or_default()
+                                    }
+                                    else {
+                                        a
+                                    }
+                                )),
+                                (Some(Value::Number(a)), Value::Number(b)) => Ok(Value::Number(a - b)),
+                                _ => Err(n.error("subtraction is unsupported between this types")),
+                            }
+                        },
+                        _ => Err(n.error("unexpected")),
+                    };
+                    match result {
+                        Ok(v) => { value = Some(v); },
+                        Err(W(diagnostic)) => { scope.diagnostics.push(diagnostic); }
+                    }
+                }
+                Syntax::Value(scope.define_or_reference(
+                    url,
+                    left.expect("variable")?,
+                    context.documentation,
+                    value.ok_or_else(|| node.error("expected assignment"))?
+                )?)
+            },
+            "function_definition" => {
+                Syntax::Value(scope.define(
+                    url,
+                    node.expect("name")?,
+                    std::mem::take(&mut context.documentation),
+                    Value::Function
+                )?)
+            },
+            _ => { return Ok(None); },
+        }))
+    }
+
+    fn resolve(&self, url: &Url, scope: &mut Scope, node: W<Node<'_>>, syntax: Syntax) -> std::result::Result<Value, W<Diagnostic>> {
+        Ok(match syntax {
+            Syntax::Value(v) => v,
+            Syntax::Usage(Usage::Local(n) | Usage::Parent(n)) =>
+                scope.definitions.entry(n).or_default().reference(url, node)?,
+            _ => Err(node.error("cannot resolve"))?,
         })
     }
 
@@ -1242,18 +1299,18 @@ mod tests {
         assert_eq!(scope.diagnostics, Vec::new());
         match std::env::consts::OS {
             "linux" => {
-                assert!(matches!(scope.definitions.get("__LINUX__"), Some(Symbol { value: Some(Value::Macro(true)), .. })));
+                assert!(matches!(scope.definitions.get("__LINUX__"), Some(Symbol { value: Some(Value::Bool(true)), .. })));
                 assert!(scope.definitions.get("__WINDOWS__").is_none());
                 assert!(scope.definitions.get("__OSX__").is_none());
             },
             "macos" => {
                 assert!(scope.definitions.get("__LINUX__").is_none());
                 assert!(scope.definitions.get("__WINDOWS__").is_none());
-                assert!(matches!(scope.definitions.get("__OSX__"), Some(Symbol { value: Some(Value::Macro(true)), .. })));
+                assert!(matches!(scope.definitions.get("__OSX__"), Some(Symbol { value: Some(Value::Bool(true)), .. })));
             },
             "windows" => {
                 assert!(scope.definitions.get("__LINUX__").is_none());
-                assert!(matches!(scope.definitions.get("__WINDOWS__"), Some(Symbol { value: Some(Value::Macro(true)), .. })));
+                assert!(matches!(scope.definitions.get("__WINDOWS__"), Some(Symbol { value: Some(Value::Bool(true)), .. })));
                 assert!(scope.definitions.get("__OSX__").is_none());
             },
             _ => {},
@@ -1522,6 +1579,70 @@ mod tests {
         }]);
         let symbol = scope.definitions.get("B").expect("wrong symbol name");
         assert_eq!(symbol.value, Some(Value::Function));
+    }
+
+    #[tokio::test]
+    async fn reassign_number() {
+        let (_, scope) = make_file("memory:///reassign.bff", ".A = 3\n.A = 4").await;
+        assert_eq!(scope.diagnostics, Vec::new());
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        let symbol = scope.definitions.get("A").expect("undefined");
+        assert_eq!(symbol.value, Some(Value::Number(4)));
+    }
+
+    #[tokio::test]
+    async fn reassign_string() {
+        let (_, scope) = make_file("memory:///reassign_string.bff", ".A = 'a'\n.A = 'b'").await;
+        assert_eq!(scope.diagnostics, Vec::new());
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        let symbol = scope.definitions.get("A").expect("undefined");
+        assert_eq!(symbol.value, Some(Value::String("b".into())));
+    }
+
+    #[tokio::test]
+    async fn concat_string() {
+        let (_, scope) = make_file("memory:///concat_string.bff", ".A = 'a'\n+ 'b'").await;
+        assert_eq!(scope.diagnostics, Vec::new());
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        let symbol = scope.definitions.get("A").expect("undefined");
+        assert_eq!(symbol.value, Some(Value::String("ab".into())));
+    }
+
+    #[tokio::test]
+    async fn add_number() {
+        let (_, scope) = make_file("memory:///add_number.bff", ".A = 3\n+ 4").await;
+        assert_eq!(scope.diagnostics, Vec::new());
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        let symbol = scope.definitions.get("A").expect("undefined");
+        assert_eq!(symbol.value, Some(Value::Number(7)));
+    }
+
+    #[tokio::test]
+    async fn subtract_string() {
+        let (_, scope) = make_file("memory:///subtract_string.bff", ".A = 'a and other'\n- 'a'").await;
+        assert_eq!(scope.diagnostics, Vec::new());
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        let symbol = scope.definitions.get("A").expect("undefined");
+        assert_eq!(symbol.value, Some(Value::String(" and other".into())));
+    }
+
+    #[tokio::test]
+    async fn subtract_number() {
+        let (_, scope) = make_file("memory:///subtract_number.bff", ".A = 3\n- 2").await;
+        assert_eq!(scope.diagnostics, Vec::new());
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        let symbol = scope.definitions.get("A").expect("undefined");
+        assert_eq!(symbol.value, Some(Value::Number(1)));
+    }
+
+    #[tokio::test]
+    async fn wrong_typing() {
+        let (_, scope) = make_file("memory:///wrong_typing.bff", ".A = 3\n- 'a'").await;
+        assert_eq!(scope.semantic_tokens, Vec::new());
+        let diagnostic = scope.diagnostics.first().expect("no diagnostics");
+        assert_eq!(diagnostic.message, "subtraction is unsupported between this types");
+        assert_eq!(diagnostic.range.start, Position::new(1, 0));
+        assert_eq!(diagnostic.range.end, Position::new(1, 5));
     }
 
 }

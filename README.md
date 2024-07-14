@@ -11,8 +11,8 @@ A language server for [FASTBuild](https://fastbuild.org)
 - [x] Autocompletion
 - [x] Go to definition
 - [x] Find references
+- [x] Dynamic type checking
 - [ ] Rename
-- [ ] Dynamic type checking
 - [ ] Code actions/suggestions
 
 ## Installation
