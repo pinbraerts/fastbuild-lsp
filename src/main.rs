@@ -1205,7 +1205,7 @@ mod tests {
 
     #[tokio::test]
     async fn preprocessor_if() {
-        let (_, scope) = make_file("memory:///preprocessor_if.bff", "#if 1\n.A = 3\n#else\n.B = 4\n#endif").await;
+        let (_, scope) = make_file("memory:///preprocessor_if.bff", "#if (((1)))\n.A = 3\n#else\n.B = 4\n#endif").await;
         assert_eq!(scope.diagnostics, Vec::new());
         let token = scope.semantic_tokens.first().expect("no semantic tokens");
         assert_eq!(token.delta_line, 3);
