@@ -47,14 +47,16 @@ impl Value {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Usage {
     Local(String),
     Parent(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Default)]
 enum Syntax {
+    #[default]
+    Unit,
     Usage(Usage),
     Value(Value),
     Assign(Value),
@@ -448,6 +450,7 @@ impl Backend {
                 ||
                 self.preprocess_expression(url, scope, node.expect("right")?)?
             },
+            //"parenthesis" => self.preprocess_expression(url, scope, node.get(1)?)?,
             "call" => {
                 let argument = node.expect("arguments")?;
                 match node.expect("name")?.text(scope.content.as_bytes())? {
@@ -688,6 +691,7 @@ impl Backend {
                     Value::Function
                 )?)
             },
+            "parenthesis" => context.unnamed.first().map(|x| x.1.clone()).unwrap_or(Syntax::Unit),
             _ => { return Ok(None); },
         }))
     }
@@ -1590,7 +1594,7 @@ mod tests {
 
     #[tokio::test]
     async fn reassign_number() {
-        let (_, scope) = make_file("memory:///reassign.bff", ".A = 3\n.A = 4").await;
+        let (_, scope) = make_file("memory:///reassign.bff", ".A = (((3)))\n.A = 4").await;
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
         let symbol = scope.definitions.get("A").expect("undefined");
@@ -1599,7 +1603,7 @@ mod tests {
 
     #[tokio::test]
     async fn reassign_string() {
-        let (_, scope) = make_file("memory:///reassign_string.bff", ".A = 'a'\n.A = 'b'").await;
+        let (_, scope) = make_file("memory:///reassign_string.bff", ".A = ('a')\n.A = 'b'").await;
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
         let symbol = scope.definitions.get("A").expect("undefined");
@@ -1627,7 +1631,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_number() {
-        let (_, scope) = make_file("memory:///add_number.bff", ".A = 3\n+ 4").await;
+        let (_, scope) = make_file("memory:///add_number.bff", ".A = 3\n+ (((4)))").await;
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
         let symbol = scope.definitions.get("A").expect("undefined");
@@ -1636,7 +1640,7 @@ mod tests {
 
     #[tokio::test]
     async fn subtract_string() {
-        let (_, scope) = make_file("memory:///subtract_string.bff", ".A = 'a and other'\n- 'a'").await;
+        let (_, scope) = make_file("memory:///subtract_string.bff", ".A = ('a and other')\n- 'a'").await;
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
         let symbol = scope.definitions.get("A").expect("undefined");
@@ -1650,7 +1654,7 @@ mod tests {
 
     #[tokio::test]
     async fn subtract_number() {
-        let (_, scope) = make_file("memory:///subtract_number.bff", ".A = 3\n- 2").await;
+        let (_, scope) = make_file("memory:///subtract_number.bff", ".A = 3\n- (((2)))").await;
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
         let symbol = scope.definitions.get("A").expect("undefined");
@@ -1659,7 +1663,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_typing() {
-        let (_, scope) = make_file("memory:///wrong_typing.bff", ".A = 3\n- 'a'").await;
+        let (_, scope) = make_file("memory:///wrong_typing.bff", ".A = (3)\n- 'a'").await;
         assert_eq!(scope.semantic_tokens, Vec::new());
         let diagnostic = scope.diagnostics.first().expect("no diagnostics");
         assert_eq!(diagnostic.message, "subtraction is unsupported between Number and String");
