@@ -2,6 +2,7 @@ pub mod parser_pool;
 pub mod error;
 pub mod helpers;
 
+use itertools::Itertools;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use futures::future::{join_all, BoxFuture};
@@ -998,8 +999,9 @@ impl LanguageServer for Backend {
         Ok(self.files
             .get(&params.text_document.uri)
             .map(|f| f.semantic_tokens
-                .windows(2)
-                .filter_map(|a| Some(delta(a.first()?, a.get(1)?)))
+                .iter()
+                .tuple_windows()
+                .map(|(a, b)| delta(a, b))
                 .collect()
             )
             .map(|t| SemanticTokensResult::Tokens(SemanticTokens {
