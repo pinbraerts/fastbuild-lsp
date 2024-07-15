@@ -443,7 +443,7 @@ impl Backend {
                 ||
                 self.preprocess_expression(url, scope, node.expect("right")?)?
             },
-            //"parenthesis" => self.preprocess_expression(url, scope, node.get(1)?)?,
+            "parenthesis" => self.preprocess_expression(url, scope, node.get(0)?)?,
             "call" => {
                 let argument = node.expect("arguments")?;
                 match node.expect("name")?.text(scope)? {
@@ -533,7 +533,7 @@ impl Backend {
                             .map(|line| SemanticToken {
                                 delta_line: line as u32,
                                 delta_start: 0,
-                                length: u32::max_value(),
+                                length: u32::MAX,
                                 token_type: 0,
                                 token_modifiers_bitset: 0,
                             })
@@ -1210,7 +1210,7 @@ mod tests {
         let token = scope.semantic_tokens.first().expect("no semantic tokens");
         assert_eq!(token.delta_line, 3);
         assert_eq!(token.delta_start, 0);
-        assert_eq!(token.length, u32::max_value());
+        assert_eq!(token.length, u32::MAX);
         assert_eq!(token.token_modifiers_bitset, 0);
         assert_eq!(token.token_type, 0);
     }
@@ -1222,7 +1222,7 @@ mod tests {
         let token = scope.semantic_tokens.first().expect("no semantic tokens");
         assert_eq!(token.delta_line, 1, "mismatching lines");
         assert_eq!(token.delta_start, 0, "mismatching columns");
-        assert_eq!(token.length, u32::max_value(), "mismatching length");
+        assert_eq!(token.length, u32::MAX, "mismatching length");
         assert_eq!(token.token_modifiers_bitset, 0, "mismatching modifiers");
         assert_eq!(token.token_type, 0, "mismatching types");
     }
@@ -1235,7 +1235,7 @@ mod tests {
         assert_eq!(scope.diagnostics, vec![]);
         assert_eq!(token.delta_line, 6, "mismatching lines");
         assert_eq!(token.delta_start, 0, "mismatching columns");
-        assert_eq!(token.length, u32::max_value(), "mismatching length");
+        assert_eq!(token.length, u32::MAX, "mismatching length");
         assert_eq!(token.token_modifiers_bitset, 0, "mismatching modifiers");
         assert_eq!(token.token_type, 0, "mismatching types");
     }
@@ -1290,7 +1290,7 @@ mod tests {
         assert_eq!(scope.semantic_tokens.first(), Some(&SemanticToken {
             delta_line: 2,
             delta_start: 0,
-            length: u32::max_value(),
+            length: u32::MAX,
             token_type: 0,
             token_modifiers_bitset: 0,
         }));
@@ -1304,18 +1304,18 @@ mod tests {
         match std::env::consts::OS {
             "linux" => {
                 assert!(matches!(scope.definitions.get("__LINUX__"), Some(Symbol { value: Some(Value::Bool(true)), .. })));
-                assert!(scope.definitions.get("__WINDOWS__").is_none());
-                assert!(scope.definitions.get("__OSX__").is_none());
+                assert!(!scope.definitions.contains_key("__WINDOWS__"));
+                assert!(!scope.definitions.contains_key("__OSX__"));
             },
             "macos" => {
-                assert!(scope.definitions.get("__LINUX__").is_none());
-                assert!(scope.definitions.get("__WINDOWS__").is_none());
+                assert!(!scope.definitions.contains_key("__LINUX__"));
+                assert!(!scope.definitions.contains_key("__WINDOWS__"));
                 assert!(matches!(scope.definitions.get("__OSX__"), Some(Symbol { value: Some(Value::Bool(true)), .. })));
             },
             "windows" => {
-                assert!(scope.definitions.get("__LINUX__").is_none());
+                assert!(!scope.definitions.contains_key("__LINUX__"));
                 assert!(matches!(scope.definitions.get("__WINDOWS__"), Some(Symbol { value: Some(Value::Bool(true)), .. })));
-                assert!(scope.definitions.get("__OSX__").is_none());
+                assert!(!scope.definitions.contains_key("__OSX__"));
             },
             _ => {},
         }
@@ -1337,7 +1337,7 @@ mod tests {
                 assert_eq!(scope.semantic_tokens, vec![SemanticToken {
                     delta_line: 3,
                     delta_start: 0,
-                    length: u32::max_value(),
+                    length: u32::MAX,
                     token_type: 0,
                     token_modifiers_bitset: 0,
                 }]);
@@ -1551,7 +1551,7 @@ mod tests {
         assert_eq!(scope.semantic_tokens, vec![SemanticToken {
             delta_start: 0,
             delta_line: 4,
-            length: u32::max_value(),
+            length: u32::MAX,
             token_type: 0,
             token_modifiers_bitset: 0,
         }]);
@@ -1564,7 +1564,7 @@ mod tests {
         assert_eq!(scope.semantic_tokens, vec![SemanticToken {
             delta_start: 0,
             delta_line: 4,
-            length: u32::max_value(),
+            length: u32::MAX,
             token_type: 0,
             token_modifiers_bitset: 0,
         }]);
@@ -1577,7 +1577,7 @@ mod tests {
         assert_eq!(scope.semantic_tokens, vec![SemanticToken {
             delta_start: 0,
             delta_line: 2,
-            length: u32::max_value(),
+            length: u32::MAX,
             token_type: 0,
             token_modifiers_bitset: 0,
         }]);
