@@ -6,11 +6,11 @@ use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use futures::future::{join_all, BoxFuture};
 use futures::FutureExt;
-use helpers::W;
+use helpers::*;
 use request::{GotoDeclarationParams, GotoDeclarationResponse};
 use tokio::io::AsyncReadExt;
 use tokio::sync::OnceCell;
-use tree_sitter::{Node, Parser, Point, Tree};
+use tree_sitter::{Node, Parser, Tree};
 
 use tokio::fs::File;
 
@@ -96,14 +96,11 @@ impl Default for Symbol {
 
 impl Symbol {
 
-    fn define(&mut self, url: &Url, node: W<Node>, documentation: String, value: Value) -> std::result::Result<Value, W<Diagnostic>> {
+    fn define(&mut self, url: &Url, node: Node, documentation: String, value: Value) -> std::result::Result<Value, Diagnostic> {
         match &self.definition {
             Some(location) => Err(node.error(
                 "macro redefinition"
-            ).with(Some(vec![DiagnosticRelatedInformation {
-                location: location.clone(),
-                message: "defined here".into(),
-            }]))),
+            ).related(Some(location.message("defined here")))),
             _ => {
                 self.value = Some(value.clone());
                 self.documentation = markdown(documentation);
@@ -113,39 +110,29 @@ impl Symbol {
         }
     }
 
-    fn undefine(&mut self, url: &Url, node: W<Node>) -> std::result::Result<(), W<Diagnostic>> {
+    fn undefine(&mut self, url: &Url, node: Node) -> std::result::Result<(), Diagnostic> {
         match self.definition {
             Some(_) => {
                 self.value = None;
                 self.references.push(node.url(url));
                 Ok(())
             },
-            _ => Err(None),
-        }.map_err(|location| node.error("trying to undefine undefined macro")
-            .with(location.map(|location| vec![DiagnosticRelatedInformation {
-                location,
-                message: "undefined here".into(),
-            }]))
-        )
+            _ => Err(node.error("trying to undefine undefined macro")),
+        }
     }
 
-    fn reference(&mut self, url: &Url, node: W<Node>) -> std::result::Result<Value, W<Diagnostic>> {
+    fn reference(&mut self, url: &Url, node: Node) -> std::result::Result<Value, Diagnostic> {
         match &self.definition {
             //Some((location, Reference::Undef)) => Err(Some(location.clone())),
             Some(_) => {
                 self.references.push(node.url(url));
                 Ok(self.value.clone().unwrap_or(Value::Bool(false)))
             },
-            _ => Err(None),
-        }.map_err(|location| node.error("accessing undefined variable")
-            .with(location.map(|location| vec![DiagnosticRelatedInformation {
-                location,
-                message: "undefined here".into(),
-            }]))
-        )
+            _ => Err(node.error("accessing undefined variable")),
+        }
     }
 
-    fn define_or_reference(&mut self, url: &Url, node: W<Node>, documentation: String, value: Value) -> Value {
+    fn define_or_reference(&mut self, url: &Url, node: Node, documentation: String, value: Value) -> Value {
         match self.definition {
             Some(_) => {
                 self.references.push(node.url(url));
@@ -155,8 +142,8 @@ impl Symbol {
             },
         };
         self.documentation = markdown(documentation);
-        self.value = Some(value);
-        self.value.clone().expect("just set it above")
+        self.value = Some(value.clone());
+        value
     }
 
 }
@@ -177,13 +164,13 @@ struct Scope {
     faulty_ranges: Vec<tree_sitter::Range>,
 }
 
-type IfStack<'tree> = Vec<(bool, W<Node<'tree>>, Option<W<Node<'tree>>>)>;
+type IfStack<'tree> = Vec<(bool, Node<'tree>, Option<Node<'tree>>)>;
 
 #[derive(Debug, Default)]
 struct Context<'tree> {
     documentation: String,
-    named: HashMap<String, (W<Node<'tree>>, Syntax)>,
-    unnamed: Vec<(W<Node<'tree>>, Syntax)>,
+    named: HashMap<String, (Node<'tree>, Syntax)>,
+    unnamed: Vec<(Node<'tree>, Syntax)>,
 }
 
 impl<'tree> Context<'tree> {
@@ -192,7 +179,7 @@ impl<'tree> Context<'tree> {
         Self { documentation, ..Default::default() }
     }
 
-    fn get(&mut self, name: &str, node: W<Node<'tree>>) -> std::result::Result<(W<Node<'tree>>, Syntax), W<Diagnostic>> {
+    fn get(&mut self, name: &str, node: Node<'tree>) -> std::result::Result<(Node<'tree>, Syntax), Diagnostic> {
         self.named.remove(name).ok_or_else(|| node.error(format!("expected {}", name)))
     }
 
@@ -225,27 +212,27 @@ impl Scope {
         }
     }
 
-    fn define(&mut self, url: &Url, node: W<Node>, documentation: String, value: Value) -> std::result::Result<Value, W<Diagnostic>> {
+    fn define(&mut self, url: &Url, node: Node, documentation: String, value: Value) -> std::result::Result<Value, Diagnostic> {
         let name = node.text(self.content.as_bytes())?;
         self.definitions.entry(name.into()).or_default().define(url, node, documentation, value)
     }
 
-    fn undefine(&mut self, url: &Url, node: W<Node>) -> std::result::Result<(), W<Diagnostic>> {
+    fn undefine(&mut self, url: &Url, node: Node) -> std::result::Result<(), Diagnostic> {
         let name = node.text(self.content.as_bytes())?;
         self.definitions.entry(name.into()).or_default().undefine(url, node)
     }
 
-    fn reference(&mut self, url: &Url, node: W<Node>) -> std::result::Result<Value, W<Diagnostic>> {
+    fn reference(&mut self, url: &Url, node: Node) -> std::result::Result<Value, Diagnostic> {
         let name = node.text(self.content.as_bytes())?;
         self.definitions.entry(name.into()).or_default().reference(url, node)
     }
 
-    fn define_or_reference(&mut self, url: &Url, node: W<Node>, documentation: String, value: Value) -> std::result::Result<Value, W<Diagnostic>> {
+    fn define_or_reference(&mut self, url: &Url, node: Node, documentation: String, value: Value) -> std::result::Result<Value, Diagnostic> {
         let name = node.text(self.content.as_bytes())?;
         Ok(self.definitions.entry(name.into()).or_default().define_or_reference(url, node, documentation, value))
     }
 
-    fn find_env_variable(&self, node: W<Node>) -> std::result::Result<Value, W<Diagnostic>> {
+    fn find_env_variable(&self, node: Node) -> std::result::Result<Value, Diagnostic> {
         let name = node.text(self.content.as_bytes())?;
         match std::env::var(name) {
             Err(NotPresent) => Err(node.error("environment variable not found")),
@@ -294,6 +281,7 @@ impl Backend {
     fn preprocess(&self, url: Url, version: i32, content: String, tree: Tree) -> BoxFuture<Result<()>> {
         async move {
             self.client.log_message(MessageType::LOG, format!("preprocessing {}", url)).await;
+            println!("{}", tree.root_node().to_sexp());
             let mut cursor = tree.walk();
             let mut if_stack = vec![];
             let mut run = true;
@@ -311,12 +299,12 @@ impl Backend {
                 let traverse = self.preprocessor_enter_node(
                     &url,
                     &mut scope,
-                    cursor.node().into(),
+                    cursor.node(),
                     &mut if_stack,
                     &mut documentation
                 ).await;
                 match traverse {
-                    Err(W(diagnostic)) => scope.diagnostics.push(diagnostic),
+                    Err(diagnostic) => scope.diagnostics.push(diagnostic),
                     Ok(true) => {
                         if cursor.goto_first_child() {
                             continue;
@@ -332,9 +320,9 @@ impl Backend {
                 }
             }
             for (_, n_if, n_else) in if_stack {
-                scope.diagnostics.push(n_if.error("expected #endif").with(
+                scope.diagnostics.push(n_if.error("expected #endif").related(
                     n_else.map(|e| e.related(&url, "#else here"))
-                ).0);
+                ));
             }
             drop(cursor);
             scope.tree = tree;
@@ -349,7 +337,7 @@ impl Backend {
         }
         let mut parser = self.parsers.get().await?;
         let range = scope.tree.root_node().range();
-        let truthy_ranges = W(range).complement(scope.faulty_ranges.clone());
+        let truthy_ranges = range.complement(scope.faulty_ranges.clone());
         parser.set_included_ranges(truthy_ranges.as_slice()).map_err(|_| Error::Parse)?;
         scope.tree = parser.parse(scope.content.as_bytes(), None).ok_or(Error::Parse)?;
         parser.set_included_ranges(&[]).map_err(|_| Error::Parse)?;
@@ -364,9 +352,9 @@ impl Backend {
         let mut run = true;
         let mut documentation = String::new();
         while run {
-            let node = W(cursor.node());
+            let node = cursor.node();
             match self.enter_node(&url, &mut scope, node, &mut documentation) {
-                Err(W(diagnostic)) => { scope.diagnostics.push(diagnostic); },
+                Err(diagnostic) => { scope.diagnostics.push(diagnostic); },
                 Ok(Some(value)) => if let Some(last) = stack.last_mut() {
                     if let Some(name) = cursor.field_name() {
                         last.named.insert(name.into(), (node, Syntax::Value(value)));
@@ -386,19 +374,19 @@ impl Backend {
                     run = false;
                     break;
                 }
-                let node = W(cursor.node());
+                let node = cursor.node();
                 let context = stack
                     .pop()
-                    .ok_or_else(|| scope.diagnostics.push(node.error("internal: docs stack drained").0))
+                    .ok_or_else(|| scope.diagnostics.push(node.error("internal: docs stack drained")))
                     .unwrap_or_default();
-                match self.exit_node(&url, &mut scope, cursor.node().into(), context) {
-                    Err(W(diagnostic)) => { scope.diagnostics.push(diagnostic); },
+                match self.exit_node(&url, &mut scope, node, context) {
+                    Err(diagnostic) => { scope.diagnostics.push(diagnostic); },
                     Ok(Some(value)) => if let Some(last) = stack.last_mut() {
                         if let Some(name) = cursor.field_name() {
-                            last.named.insert(name.into(), (W(cursor.node()), value));
+                            last.named.insert(name.into(), (cursor.node(), value));
                         }
                         else {
-                            last.unnamed.push((W(cursor.node()), value));
+                            last.unnamed.push((cursor.node(), value));
                         }
                     },
                     _ => {},
@@ -434,7 +422,7 @@ impl Backend {
         Ok(())
     }
 
-    fn preprocess_expression(&self, url: &Url, scope: &mut Scope, node: W<Node>) -> std::result::Result<bool, W<Diagnostic>> {
+    fn preprocess_expression(&self, url: &Url, scope: &mut Scope, node: Node) -> std::result::Result<bool, Diagnostic> {
         Ok(match node.kind() {
             "string" => node.is_empty(),
             "decimal" => node
@@ -489,7 +477,7 @@ impl Backend {
         url.join(path).ok()
     }
 
-    fn find_file(&self, url: &Url, scope: &Scope, node: W<Node>) -> std::result::Result<Url, W<Diagnostic>> {
+    fn find_file(&self, url: &Url, scope: &Scope, node: Node) -> std::result::Result<Url, Diagnostic> {
         let path = node.text(scope.content.as_bytes())?;
         self.search_file(url, path).ok_or_else(|| node.error("could not find file"))
     }
@@ -502,7 +490,7 @@ impl Backend {
         Some(result)
     }
 
-    async fn preprocessor_enter_node<'tree>(&self, url: &Url, scope: &mut Scope, node: W<Node<'tree>>, if_stack: &mut IfStack<'tree>, documentation: &mut String) -> std::result::Result<bool, W<Diagnostic>> {
+    async fn preprocessor_enter_node<'tree>(&self, url: &Url, scope: &mut Scope, node: Node<'tree>, if_stack: &mut IfStack<'tree>, documentation: &mut String) -> std::result::Result<bool, Diagnostic> {
         let mut traverse = false;
         match node.kind() {
             "if" => {
@@ -510,7 +498,7 @@ impl Backend {
                 let result = match self.preprocess_expression(url, scope, condition) {
                     Ok(result) => result,
                     Err(diagnostic) => {
-                        scope.diagnostics.push(diagnostic.0);
+                        scope.diagnostics.push(diagnostic);
                         false
                     },
                 };
@@ -524,7 +512,7 @@ impl Backend {
                         }
                     },
                     Some((_, _, Some(n_else))) => Err(
-                        node.error("duplicate #else directive").with(
+                        node.error("duplicate #else directive").related(
                             Some(n_else.related(url, "previous #else here"))
                         )
                     )?,
@@ -601,7 +589,7 @@ impl Backend {
         Ok(traverse)
     }
 
-    fn enter_node(&self, _: &Url, scope: &mut Scope, node: W<Node<'_>>, documentation: &mut String) -> std::result::Result<Option<Value>, W<Diagnostic>> {
+    fn enter_node(&self, _: &Url, scope: &mut Scope, node: Node<'_>, documentation: &mut String) -> std::result::Result<Option<Value>, Diagnostic> {
         let value = match node.kind() {
             "if" | "else" | "endif" | "define" | "import" | "undef" | "include" | "once" | "unknown" => { return Ok(None); },
             "ERROR" => { return Err(node.error("syntax")); },
@@ -626,7 +614,7 @@ impl Backend {
         Ok(Some(value))
     }
 
-    fn exit_node<'tree>(&self, url: &Url, scope: &mut Scope, node: W<Node<'tree>>, mut context: Context<'tree>) -> std::result::Result<Option<Syntax>, W<Diagnostic>> {
+    fn exit_node<'tree>(&self, url: &Url, scope: &mut Scope, node: Node<'tree>, mut context: Context<'tree>) -> std::result::Result<Option<Syntax>, Diagnostic> {
         Ok(Some(match node.kind() {
             "usage" => {
                 let name = match context.get("variable", node)?.1 {
@@ -682,7 +670,7 @@ impl Backend {
                     };
                     match result {
                         Ok(v) => { value = Some(v); },
-                        Err(W(diagnostic)) => { scope.diagnostics.push(diagnostic); }
+                        Err(diagnostic) => { scope.diagnostics.push(diagnostic); }
                     }
                 }
                 Syntax::Value(scope.define_or_reference(
@@ -704,7 +692,7 @@ impl Backend {
         }))
     }
 
-    fn resolve(&self, url: &Url, scope: &mut Scope, node: W<Node<'_>>, syntax: Syntax) -> std::result::Result<Value, W<Diagnostic>> {
+    fn resolve(&self, url: &Url, scope: &mut Scope, node: Node<'_>, syntax: Syntax) -> std::result::Result<Value, Diagnostic> {
         Ok(match syntax {
             Syntax::Value(v) => v,
             Syntax::Usage(Usage::Local(n) | Usage::Parent(n)) =>
@@ -715,35 +703,36 @@ impl Backend {
 
     async fn find_documentation(&self, url: &Url, position: Position) -> Option<MarkupContent> {
         let file = self.files.get(url)?;
-        let point = W(position).into();
-        let node = file.tree.root_node().descendant_for_point_range(point, point).map(W)?;
+        let point = position.to_point();
+        let node = file.tree.root_node().descendant_for_point_range(point, point)?;
         let node = if !node.is_named() {
             if node.kind() == "#" {
                 node.next_named_sibling()
             }
             else {
                 node.parent().or_else(|| node.next_named_sibling())
-            }.map(W)?
+            }?
         }
         else {
             node
         };
-        let word = match node.kind() {
+        let argument = match node.kind() {
             "identifier" => Ok(node),
             "interpolation" => node.expect("variable"),
             "call" | "function_definition" => node.expect("name"),
             "usage" => node.expect("variable"),
             "placeholder" => node.expect("argument"),
             _ => Err(Diagnostic::default()),
-        }.ok()?.text(file.content.as_bytes()).ok()?;
+        }.ok()?;
+        let word = argument.text(file.content.as_bytes()).ok()?;
         let symbol = file.definitions.get(word)?;
         Some(symbol.documentation.clone())
     }
 
     async fn suggest_completions(&self, url: Url, position: Position, trigger: String) -> Option<Vec<CompletionItem>> {
         let file = self.files.get(&url)?;
-        let point: Point = W(position).into();
-        let node = file.tree.root_node().descendant_for_point_range(point, point).map(W)?;
+        let point = position.to_point();
+        let node = file.tree.root_node().descendant_for_point_range(point, point)?;
         Some(if trigger == "#" || ["undef", "define", "import", "include", "once", "else", "endif", "undef", "unknown"].contains(&node.kind()) {
             vec![
                 CompletionItem {
@@ -832,20 +821,20 @@ impl Backend {
 
     async fn get_declarations(&self, url: &Url, position: Position) -> Option<Vec<Location>> {
         let file = self.files.get(url)?;
-        let point = W(position).into();
-        let node = file.tree.root_node().descendant_for_point_range(point, point).map(W)?;
+        let point = position.to_point();
+        let node = file.tree.root_node().descendant_for_point_range(point, point)?;
         let node = if !node.is_named() {
             if node.kind() == "#" {
                 node.next_named_sibling()
             }
             else {
                 node.parent().or_else(|| node.next_named_sibling())
-            }.map(W)?
+            }?
         }
         else {
             node
         };
-        let word = match node.kind() {
+        let argument = match node.kind() {
             "identifier" => Ok(node),
             "string" => node.expect("double_quoted"),
             "interpolation" | "define" | "undef" | "import"
@@ -857,23 +846,25 @@ impl Backend {
             "usage" => node.expect("variable"),
             "placeholder" => node.expect("argument"),
             _ => Err(Diagnostic::default()),
-        }.ok()?.text(file.content.as_bytes()).ok()?;
+        }.ok()?;
+        let word = argument.text(file.content.as_bytes()).ok()?;
         let symbol = file.definitions.get(word)?;
         Some(vec![symbol.definition.clone()?])
     }
 
     async fn get_references(&self, url: &Url, position: Position, include_declaration: bool) -> Option<Vec<Location>> {
         let file = self.files.get(url)?;
-        let point = W(position).into();
-        let node = file.tree.root_node().descendant_for_point_range(point, point).map(W)?;
-        let word = match node.kind() {
+        let point = position.to_point();
+        let node = file.tree.root_node().descendant_for_point_range(point, point)?;
+        let argument = match node.kind() {
             "identifier" => Ok(node),
             "interpolation" => node.expect("variable"),
             "call" | "function_definition" => node.expect("name"),
             "usage" => node.expect("variable"),
             "placeholder" => node.expect("argument"),
             _ => Err(Diagnostic::default()),
-        }.ok()?.text(file.content.as_bytes()).ok()?;
+        }.ok()?;
+        let word = argument.text(file.content.as_bytes()).ok()?;
         let symbol = file.definitions.get(word)?;
         let mut references = Vec::new();
         if include_declaration {
@@ -1007,10 +998,13 @@ impl LanguageServer for Backend {
 
     async fn semantic_tokens_full(&self, params: SemanticTokensParams) -> jsonrpc::Result<Option<SemanticTokensResult>> {
         trace!("textDocument/semanticTokens/full {:?}", params);
-        let mut prev = SemanticToken::default();
         Ok(self.files
             .get(&params.text_document.uri)
-            .map(|f| f.semantic_tokens.iter().map(|t| W(*t).delta(&mut prev)).collect())
+            .map(|f| f.semantic_tokens
+                .windows(2)
+                .filter_map(|a| Some(delta(a.first()?, a.get(1)?)))
+                .collect()
+            )
             .map(|t| SemanticTokensResult::Tokens(SemanticTokens {
                 data: t,
                 ..Default::default()
@@ -1538,7 +1532,7 @@ mod tests {
         assert_eq!(scope.semantic_tokens, Vec::new());
         let definition = scope.definitions.get("A").expect("undefined");
         assert_eq!(definition.documentation, markdown("documentation\nfor A\n"));
-        assert_eq!(definition.value, Some(Value::Number(3)));
+        assert!(matches!(definition.value, Some(Value::Number(3))));
         assert_eq!(definition.definition, Some(Location::new(uri, Range::new(Position::new(2, 1), Position::new(2, 2)))));
     }
 
@@ -1549,7 +1543,7 @@ mod tests {
         assert_eq!(scope.semantic_tokens, Vec::new());
         let definition = scope.definitions.get("B").expect("undefined");
         assert_eq!(definition.documentation, markdown("documentation\nfor B\n"));
-        assert_eq!(definition.value, Some(Value::Number(3)));
+        assert!(matches!(definition.value, Some(Value::Number(3))));
         assert_eq!(definition.definition, Some(Location::new(uri, Range::new(Position::new(3, 1), Position::new(3, 2)))));
     }
 
@@ -1591,7 +1585,7 @@ mod tests {
             token_modifiers_bitset: 0,
         }]);
         let symbol = scope.definitions.get("B").expect("wrong symbol name");
-        assert_eq!(symbol.value, Some(Value::Function));
+        assert!(matches!(symbol.value, Some(Value::Function)));
     }
 
     #[tokio::test]
@@ -1600,7 +1594,7 @@ mod tests {
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
         let symbol = scope.definitions.get("A").expect("undefined");
-        assert_eq!(symbol.value, Some(Value::Number(4)));
+        assert!(matches!(symbol.value, Some(Value::Number(4))));
     }
 
     #[tokio::test]
@@ -1609,7 +1603,12 @@ mod tests {
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
         let symbol = scope.definitions.get("A").expect("undefined");
-        assert_eq!(symbol.value, Some(Value::String("b".into())));
+        if let Some(Value::String(s)) = &symbol.value {
+            assert_eq!(s, "b");
+        }
+        else {
+            panic!("wrong type");
+        }
     }
 
     #[tokio::test]
@@ -1618,7 +1617,12 @@ mod tests {
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
         let symbol = scope.definitions.get("A").expect("undefined");
-        assert_eq!(symbol.value, Some(Value::String("ab".into())));
+        if let Some(Value::String(s)) = &symbol.value {
+            assert_eq!(s, "ab");
+        }
+        else {
+            panic!("wrong type");
+        }
     }
 
     #[tokio::test]
@@ -1627,7 +1631,7 @@ mod tests {
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
         let symbol = scope.definitions.get("A").expect("undefined");
-        assert_eq!(symbol.value, Some(Value::Number(7)));
+        assert!(matches!(symbol.value, Some(Value::Number(7))));
     }
 
     #[tokio::test]
@@ -1636,7 +1640,12 @@ mod tests {
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
         let symbol = scope.definitions.get("A").expect("undefined");
-        assert_eq!(symbol.value, Some(Value::String(" and other".into())));
+        if let Some(Value::String(s)) = &symbol.value {
+            assert_eq!(s, " and other");
+        }
+        else {
+            panic!("wrong type");
+        }
     }
 
     #[tokio::test]
@@ -1645,7 +1654,7 @@ mod tests {
         assert_eq!(scope.diagnostics, Vec::new());
         assert_eq!(scope.semantic_tokens, Vec::new());
         let symbol = scope.definitions.get("A").expect("undefined");
-        assert_eq!(symbol.value, Some(Value::Number(1)));
+        assert!(matches!(symbol.value, Some(Value::Number(1))));
     }
 
     #[tokio::test]
