@@ -132,7 +132,7 @@ pub trait ExtendedNode: Sized {
     fn warning(&self, message: impl Into<String>) -> Diagnostic;
     fn expect(&self, name: &str) -> std::result::Result<Self, Diagnostic>;
     fn get(&self, index: usize) -> std::result::Result<Self, Diagnostic>;
-    fn text<'content>(&self, content: &'content [u8]) -> std::result::Result<&'content str, Diagnostic>;
+    fn text<'content>(&self, content: &'content impl AsRef<[u8]>) -> std::result::Result<&'content str, Diagnostic>;
     fn url(&self, url: &Url) -> Location;
     fn related(&self, url: &Url, message: impl Into<String>) -> DiagnosticRelatedInformation;
 }
@@ -167,11 +167,11 @@ impl ExtendedNode for Node<'_> {
 
     fn expect(&self, name: &str) -> std::result::Result<Self, Diagnostic> {
         self.child_by_field_name(name)
-            .ok_or_else(|| self.error(format!("expected {}", name)))
+            .ok_or_else(|| self.error(format!("expected {name}")))
     }
 
-    fn text<'content>(&self, content: &'content [u8]) -> std::result::Result<&'content str, Diagnostic> {
-        self.utf8_text(content).map_err(|_| self.error("non-unicode text"))
+    fn text<'content>(&self, content: &'content impl AsRef<[u8]>) -> std::result::Result<&'content str, Diagnostic> {
+        self.utf8_text(content.as_ref()).map_err(|_| self.error("non-unicode text"))
     }
 }
 

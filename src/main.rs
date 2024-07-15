@@ -191,6 +191,12 @@ impl Default for Scope {
     }
 }
 
+impl AsRef<[u8]> for Scope {
+    fn as_ref(&self) -> &[u8] {
+        self.content.as_bytes()
+    }
+}
+
 impl Scope {
 
     fn new(version: i32, content: String) -> Self {
@@ -203,27 +209,27 @@ impl Scope {
     }
 
     fn define(&mut self, url: &Url, node: Node, documentation: String, value: Value) -> std::result::Result<Value, Diagnostic> {
-        let name = node.text(self.content.as_bytes())?;
+        let name = node.text(self)?;
         self.definitions.entry(name.into()).or_default().define(url, node, documentation, value)
     }
 
     fn undefine(&mut self, url: &Url, node: Node) -> std::result::Result<(), Diagnostic> {
-        let name = node.text(self.content.as_bytes())?;
+        let name = node.text(self)?;
         self.definitions.entry(name.into()).or_default().undefine(url, node)
     }
 
     fn reference(&mut self, url: &Url, node: Node) -> std::result::Result<Value, Diagnostic> {
-        let name = node.text(self.content.as_bytes())?;
+        let name = node.text(self)?;
         self.definitions.entry(name.into()).or_default().reference(url, node)
     }
 
     fn define_or_reference(&mut self, url: &Url, node: Node, documentation: String, value: Value) -> std::result::Result<Value, Diagnostic> {
-        let name = node.text(self.content.as_bytes())?;
+        let name = node.text(self)?;
         Ok(self.definitions.entry(name.into()).or_default().define_or_reference(url, node, documentation, value))
     }
 
     fn find_env_variable(&self, node: Node) -> std::result::Result<Value, Diagnostic> {
-        let name = node.text(self.content.as_bytes())?;
+        let name = node.text(self)?;
         match std::env::var(name) {
             Err(NotPresent) => Err(node.error("environment variable not found")),
             Err(NotUnicode(_)) => Err(node.error("not unicode")),
@@ -415,7 +421,7 @@ impl Backend {
         Ok(match node.kind() {
             "string" => node.is_empty(),
             "decimal" => node
-                .text(scope.content.as_bytes())?
+                .text(scope)?
                 .parse::<i32>()
                 .unwrap_or_default() != 0,
             "identifier" => {
@@ -440,7 +446,7 @@ impl Backend {
             //"parenthesis" => self.preprocess_expression(url, scope, node.get(1)?)?,
             "call" => {
                 let argument = node.expect("arguments")?;
-                match node.expect("name")?.text(scope.content.as_bytes())? {
+                match node.expect("name")?.text(scope)? {
                     "exists" => scope.find_env_variable(argument).map(|_| ()),
                     "file_exists" => self.find_file(url, scope, argument.expect("double_quoted")?).and(Ok(())),
                     _ => Err(node.error("unknown macro function")),
@@ -468,7 +474,7 @@ impl Backend {
     }
 
     fn find_file(&self, url: &Url, scope: &Scope, node: Node) -> std::result::Result<Url, Diagnostic> {
-        let path = node.text(scope.content.as_bytes())?;
+        let path = node.text(scope)?;
         self.search_file(url, path).ok_or_else(|| node.error("could not find file"))
     }
 
@@ -566,7 +572,7 @@ impl Backend {
             "once" => { scope.once = true; },
             "unknown" => { Err(node.error("unknown directive"))? },
             "comment" => {
-                let text = node.text(scope.content.as_bytes())?;
+                let text = node.text(scope)?;
                 *documentation += text.get(2..).unwrap_or_default();
                 documentation.push('\n');
                 return Ok(false);
@@ -584,18 +590,18 @@ impl Backend {
             "if" | "else" | "endif" | "define" | "import" | "undef" | "include" | "once" | "unknown" => { return Ok(None); },
             "ERROR" => { return Err(node.error("syntax")); },
             "comment" => {
-                let text = node.text(scope.content.as_bytes())?;
+                let text = node.text(scope)?;
                 *documentation += text.get(2..).unwrap_or_default();
                 documentation.push('\n');
                 return Ok(None);
             },
-            "string" => Value::String(node.expect("double_quoted").or(node.expect("single_quoted"))?.text(scope.content.as_bytes())?.into()),
+            "string" => Value::String(node.expect("double_quoted").or(node.expect("single_quoted"))?.text(scope)?.into()),
             "decimal" => Value::Number(node
-                .text(scope.content.as_bytes())?
+                .text(scope)?
                 .parse::<i32>()
                 .unwrap_or_default()),
-            "boolean" => Value::Bool(node.text(scope.content.as_bytes())? == "true"),
-            "identifier" => Value::Identifier(node.text(scope.content.as_bytes())?.into()),
+            "boolean" => Value::Bool(node.text(scope)? == "true"),
+            "identifier" => Value::Identifier(node.text(scope)?.into()),
             _ => {
                 return Ok(None);
             }
@@ -715,7 +721,7 @@ impl Backend {
             "placeholder" => node.expect("argument"),
             _ => Err(Diagnostic::default()),
         }.ok()?;
-        let word = argument.text(file.content.as_bytes()).ok()?;
+        let word = argument.text(file.value()).ok()?;
         let symbol = file.definitions.get(word)?;
         Some(symbol.documentation.clone())
     }
@@ -838,7 +844,7 @@ impl Backend {
             "placeholder" => node.expect("argument"),
             _ => Err(Diagnostic::default()),
         }.ok()?;
-        let word = argument.text(file.content.as_bytes()).ok()?;
+        let word = argument.text(file.value()).ok()?;
         let symbol = file.definitions.get(word)?;
         Some(vec![symbol.definition.clone()?])
     }
@@ -855,7 +861,7 @@ impl Backend {
             "placeholder" => node.expect("argument"),
             _ => Err(Diagnostic::default()),
         }.ok()?;
-        let word = argument.text(file.content.as_bytes()).ok()?;
+        let word = argument.text(file.value()).ok()?;
         let symbol = file.definitions.get(word)?;
         let mut references = Vec::new();
         if include_declaration {
