@@ -332,7 +332,7 @@ impl Backend {
         }
         let mut parser = self.parsers.get().await?;
         let range = scope.tree.root_node().range();
-        let truthy_ranges = range.complement(scope.faulty_ranges.clone());
+        let truthy_ranges = complement(&range, scope.faulty_ranges.iter());
         parser.set_included_ranges(truthy_ranges.as_slice()).map_err(|_| Error::Parse)?;
         scope.tree = parser.parse(scope.content.as_bytes(), None).ok_or(Error::Parse)?;
         parser.set_included_ranges(&[]).map_err(|_| Error::Parse)?;

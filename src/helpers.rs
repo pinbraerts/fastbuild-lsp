@@ -58,10 +58,6 @@ pub trait Sizable {
     fn size(&self) -> usize;
 }
 
-pub trait Completable: Sized {
-    fn complement(&self, ranges: Vec<Self>) -> Vec<Self>;
-}
-
 impl Sizable for tree_sitter::Range {
     fn is_empty(&self) -> bool {
         self.end_byte <= self.start_byte
@@ -77,31 +73,30 @@ impl Sizable for tree_sitter::Range {
     }
 }
 
-impl Completable for tree_sitter::Range {
-    fn complement(&self, ranges: Vec<Self>) -> Vec<Self> {
-        let mut result = Vec::new();
-        let mut start_point = self.start_point;
-        let mut start_byte = self.start_byte;
-        for range in ranges {
-            result.push(tree_sitter::Range {
-                start_point,
-                start_byte,
-                end_point: range.start_point,
-                end_byte: range.start_byte,
-            });
-            start_point = range.end_point;
-            start_byte = range.end_byte;
-        }
-        if start_byte < self.end_byte {
-            result.push(tree_sitter::Range {
-                start_point,
-                start_byte,
-                end_point: self.end_point,
-                end_byte: self.end_byte,
-            });
-        }
-        result
+pub fn complement<'a, T>(whole: &tree_sitter::Range, ranges: T) -> Vec<tree_sitter::Range>
+where T: IntoIterator<Item = &'a tree_sitter::Range> {
+    let mut result = Vec::new();
+    let mut start_point = whole.start_point;
+    let mut start_byte = whole.start_byte;
+    for range in ranges {
+        result.push(tree_sitter::Range {
+            start_point,
+            start_byte,
+            end_point: range.start_point,
+            end_byte: range.start_byte,
+        });
+        start_point = range.end_point;
+        start_byte = range.end_byte;
     }
+    if start_byte < whole.end_byte {
+        result.push(tree_sitter::Range {
+            start_point,
+            start_byte,
+            end_point: whole.end_point,
+            end_byte: whole.end_byte,
+        });
+    }
+    result
 }
 
 impl Sizable for Node<'_> {
