@@ -25,7 +25,7 @@ use tracing::{info, trace, warn};
 
 use crate::parser_pool::new_pool;
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, strum_macros::Display)]
 enum Value {
     Bool(bool),
     String(String),
@@ -33,18 +33,6 @@ enum Value {
     //Array,
     Function,
     Identifier(String),
-}
-
-impl Value {
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::Bool(_) => "Bool",
-            Self::String(_) => "String",
-            Self::Number(_) => "Number",
-            Self::Function => "Function",
-            Self::Identifier(_) => "Identifier",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -182,7 +170,7 @@ impl<'tree> Context<'tree> {
     }
 
     fn get(&mut self, name: &str, node: Node<'tree>) -> std::result::Result<(Node<'tree>, Syntax), Diagnostic> {
-        self.named.remove(name).ok_or_else(|| node.error(format!("expected {}", name)))
+        self.named.remove(name).ok_or_else(|| node.error(format!("expected {name}")))
     }
 
 }
@@ -274,7 +262,7 @@ impl Backend {
     }
 
     async fn preprocessor_parse(&self, url: Url, version: i32, content: String) -> Result<()> {
-        self.client.log_message(MessageType::LOG, format!("parsing {}", url)).await;
+        self.client.log_message(MessageType::LOG, format!("parsing {url}")).await;
         let mut parser = self.parsers.get().await?;
         let tree = parser.parse(content.as_bytes(), None).ok_or(Error::Parse)?;
         self.preprocess(url, version, content, tree).await
@@ -282,8 +270,7 @@ impl Backend {
 
     fn preprocess(&self, url: Url, version: i32, content: String, tree: Tree) -> BoxFuture<Result<()>> {
         async move {
-            self.client.log_message(MessageType::LOG, format!("preprocessing {}", url)).await;
-            println!("{}", tree.root_node().to_sexp());
+            self.client.log_message(MessageType::LOG, format!("preprocessing {url}")).await;
             let mut cursor = tree.walk();
             let mut if_stack = vec![];
             let mut run = true;
@@ -333,7 +320,7 @@ impl Backend {
     }
 
     async fn parse(&self, url: Url, mut scope: Scope) -> Result<()> {
-        self.client.log_message(MessageType::LOG, format!("parsing {}", url)).await;
+        self.client.log_message(MessageType::LOG, format!("parsing {url}")).await;
         if scope.faulty_ranges.is_empty() {
             return self.analyse(url, scope).await;
         }
@@ -347,7 +334,7 @@ impl Backend {
     }
 
     async fn analyse(&self, url: Url, mut scope: Scope) -> Result<()> {
-        self.client.log_message(MessageType::LOG, format!("analysing {}", url)).await;
+        self.client.log_message(MessageType::LOG, format!("analysing {url}")).await;
         let tree = std::mem::replace(&mut scope.tree, NULL.get().cloned().expect("no NULL tree"));
         let mut cursor = tree.walk();
         let mut stack: Vec<Context> = Vec::new();
@@ -401,7 +388,7 @@ impl Backend {
     }
 
     async fn update(&self, url: Url, scope: Scope) -> Result<()> {
-        self.client.log_message(MessageType::LOG, format!("updating diagnostics {}", url)).await;
+        self.client.log_message(MessageType::LOG, format!("updating diagnostics {url}")).await;
         self.client.publish_diagnostics(
             url.clone(),
             scope.diagnostics.clone(),
@@ -411,14 +398,14 @@ impl Backend {
         let references: Vec<Url> = self.files.iter().filter_map(|v| if v.value().references.contains(&url) { Some(v.key().clone()) } else { None }).collect();
         let should_refresh = !references.is_empty();
         let items: Vec<(Url, Scope)> = references.into_iter().filter_map(|v| self.files.remove(&v)).collect();
-        self.client.log_message(MessageType::LOG, format!("updating dependants {}", url)).await;
+        self.client.log_message(MessageType::LOG, format!("updating dependants {url}")).await;
         let _ = join_all(
             items
                 .into_iter()
                 .map(|(reference, scope)| self.preprocess(reference, scope.version, scope.content, scope.tree))
         ).await;
         if should_refresh {
-            self.client.log_message(MessageType::LOG, format!("refreshing semantic tokens {}", url)).await;
+            self.client.log_message(MessageType::LOG, format!("refreshing semantic tokens {url}")).await;
             self.client.semantic_tokens_refresh().await?;
         }
         Ok(())
@@ -486,7 +473,7 @@ impl Backend {
     }
 
     async fn get_content(&self, path: Url) -> Option<String> {
-        self.client.log_message(MessageType::LOG, format!("reading {}", path)).await;
+        self.client.log_message(MessageType::LOG, format!("reading {path}")).await;
         let mut file = File::open(path.to_file_path().ok()?).await.ok()?;
         let mut result = String::new();
         file.read_to_string(&mut result).await.ok()?;
@@ -651,7 +638,7 @@ impl Backend {
                                 (Some(Value::String(a)), Value::String(b)) => Ok(Value::String(a + &b)),
                                 (Some(Value::Number(a)), Value::Number(b)) => Ok(Value::Number(a + b)),
                                 (Some(Value::String(a)), Value::Number(b)) => Ok(Value::String(a + &b.to_string())),
-                                (Some(a), b) => Err(n.error(format!("concatenation is unsupported between {} and {}", a.kind(), b.kind()))),
+                                (Some(a), b) => Err(n.error(format!("concatenation is unsupported between {a} and {b}"))),
                             }
                         },
                         Syntax::Subtract(e) => {
@@ -666,7 +653,7 @@ impl Backend {
                                     }
                                 )),
                                 (Some(Value::Number(a)), Value::Number(b)) => Ok(Value::Number(a - b)),
-                                (Some(a), b) => Err(n.error(format!("subtraction is unsupported between {} and {}", a.kind(), b.kind()))),
+                                (Some(a), b) => Err(n.error(format!("subtraction is unsupported between {a} and {b}"))),
                             }
                         },
                         _ => Err(n.error("unexpected")),
